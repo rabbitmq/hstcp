@@ -1,0 +1,7 @@
+~$
+\.beam$
+^build/
+^dist/
+^cover/
+^erl_crash.dump$
+^c_src/libspb.so$
