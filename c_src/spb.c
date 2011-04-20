@@ -601,6 +601,9 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
           driver_send_term(sd->port, sd->pid, sd->ok_atom_spec, ATOM_SPEC_LEN);
         socket_entry_destroy(*se, sd);
         JLD(rc, sd->sockets, fd);
+      } else {
+        /* programmer messed up, but just ignore it for the time being */
+        driver_send_term(sd->port, sd->pid, sd->ok_atom_spec, ATOM_SPEC_LEN);
       }
       *fd_ptr = NULL;
       erl_drv_cond_signal(sd->cond);
