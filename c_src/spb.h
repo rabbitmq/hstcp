@@ -25,6 +25,7 @@ enum _CommandType {
   SPB_LISTEN          = 0,
   SPB_CLOSE           = 1,
   SPB_ACCEPT          = 2,
+  SPB_RECV            = 3
 };
 typedef enum _CommandType CommandType;
 
@@ -41,7 +42,8 @@ enum _AsyncCommandType {
   SPB_ASYNC_EXIT      = 2,
   SPB_ASYNC_LISTEN    = 3,
   SPB_ASYNC_CLOSE     = 4,
-  SPB_ASYNC_ACCEPT    = 5
+  SPB_ASYNC_ACCEPT    = 5,
+  SPB_ASYNC_RECV      = 6
 };
 typedef enum _AsyncCommandType AsyncCommandType;
 
