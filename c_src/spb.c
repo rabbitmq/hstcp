@@ -496,6 +496,7 @@ void socket_entry_destroy(SocketEntry *se, SpbData *const sd) {
   case LISTEN_SOCKET:
     ev_io_stop(sd->epoller, se->watcher);
     driver_free(se->watcher);
+    /* TODO - iterate through all acceptors and free them */
     JLFA(freed, se->socket.listen_socket.acceptors);
     break;
 
@@ -542,8 +543,6 @@ static void spb_ev_listen_cb(EV_P_ ev_io *w, int revents) {
       driver_send_term(sd->port, **pid, sd->ok_fd_spec, OK_FD_SPEC_LEN);
       sd->ok_fd_spec[7] = 0;
 
-      driver_free(*pid);
-
       /* figure out if there are more pending acceptors */
       JLC(index, (*se)->socket.listen_socket.acceptors, 0, -1);
       if (0 == index)
@@ -551,6 +550,8 @@ static void spb_ev_listen_cb(EV_P_ ev_io *w, int revents) {
 
       JLI(se, sd->sockets, client_sd);
       *se = connected_socket_create(client_sd, **pid, sd);
+
+      driver_free(*pid); /* was allocated in SPB_ASYNC_ACCEPT */
     } else {
       driver_failure(sd->port, -1);
     }
@@ -581,13 +582,13 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
       const int **const fd_ptr = (const int **const)data;
       const int fd = **fd_ptr;
       *fd_ptr = NULL;
-      erl_drv_cond_signal(sd->cond);
+      erl_drv_cond_signal(sd->cond); /* release the emulator thread - just bookkeeping left */
       JLI(se, sd->sockets, fd);
       *se = listen_socket_create(fd, sd);
       break;
     }
 
-  case SPB_ASYNC_CLOSE:
+  case SPB_ASYNC_CLOSE: /* note the same close code is used for listening and connected sockets */
     {
       SocketEntry **se = NULL;
       const int **const fd_ptr = (const int **const)data;
@@ -605,6 +606,7 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
         /* programmer messed up, but just ignore it for the time being */
         driver_send_term(sd->port, sd->pid, sd->ok_atom_spec, ATOM_SPEC_LEN);
       }
+      /* Only now release the emulator thread */
       *fd_ptr = NULL;
       erl_drv_cond_signal(sd->cond);
       break;
@@ -615,19 +617,19 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
       SocketEntry **se = NULL;
       const SocketAction **const sa_ptr = (const SocketAction **const)data;
       SocketAction sa = **sa_ptr;
-      *sa_ptr = NULL;
+      *sa_ptr = NULL; /* release the emulator thread - we've copied out everything we need */
       erl_drv_cond_signal(sd->cond);
       JLG(se, sd->sockets, sa.fd);
       if (NULL != se && LISTEN_SOCKET == (*se)->type) {
         Word_t index = -1;
         ErlDrvTermData **pid_ptr_found = NULL;
         ErlDrvTermData **pid_ptr = NULL;
-        /* find the last present index */
+        /* find the last present index in the list of acceptors */
         JLL(pid_ptr_found, (*se)->socket.listen_socket.acceptors, index);
         if (NULL == pid_ptr_found)
           index = 0;
         else
-          index++;
+          ++index;
         JLI(pid_ptr, (*se)->socket.listen_socket.acceptors, index);
         ErlDrvTermData *pid = (ErlDrvTermData *)driver_alloc(sizeof(ErlDrvTermData));
         if (NULL == pid)
