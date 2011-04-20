@@ -449,31 +449,44 @@ void socket_accept(SpbData *const sd, Reader *const reader) {
  ***********************/
 
 static void spb_ev_listen_cb(EV_P_ ev_io *w, int revents) {
-  SpbData *const sd = (SpbData*)(w->data);
+  SpbData *const sd = (SpbData *const)(w->data);
   struct sockaddr_in client_addr;
-  socklen_t client_len = sizeof(client_addr);
+  socklen_t client_len;
   int client_sd;
 
   int rc = 0;
   Word_t index = 0;
-  ErlDrvTermData **pid;
-  SocketEntry **se;
+  ErlDrvTermData *const *pid = NULL;
+  SocketEntry *const *se = NULL;
 
   JLG(se, sd->sockets, w->fd); /* find the SocketEntry for w->fd */
   if (NULL != se && LISTEN_SOCKET == (*se)->type) {
+    /* find first entry in acceptors */
     JLBC(pid, (*se)->socket.listen_socket.acceptors, 1, index);
-    JLD(rc, (*se)->socket.listen_socket.acceptors, index);
+
     if (NULL != pid) {
+      /* delete that entry from acceptors */
+      JLD(rc, (*se)->socket.listen_socket.acceptors, index);
+
+      client_len = sizeof(client_addr);
+      memset(&client_addr, 0, client_len);
       client_sd = accept(w->fd, (struct sockaddr *)&client_addr, &client_len);
+
       if (0 > setnonblock(client_sd))
         driver_failure(sd->port, -1);
+
       sd->ok_fd_spec[7] = client_sd;
       driver_send_term(sd->port, **pid, sd->ok_fd_spec, OK_FD_SPEC_LEN);
       sd->ok_fd_spec[7] = 0;
+
       driver_free(*pid);
+
+      /* figure out if there are more pending acceptors */
       JLC(index, (*se)->socket.listen_socket.acceptors, 0, -1);
       if (0 == index)
         ev_io_stop(EV_A_ w);
+
+      /* TODO: create CONNECTED_SOCKET entry and store */
     } else {
       driver_failure(sd->port, -1);
     }
@@ -509,12 +522,13 @@ void socket_entry_destroy(SocketEntry *se, SpbData *const sd) {
     driver_free(se->watcher);
     JLFA(freed, se->socket.listen_socket.acceptors);
     break;
+    /* TODO CONNECTED_SOCKET */
   }
   driver_free(se);
 }
 
 static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
-  SpbData *const sd = (SpbData*)(w->data);
+  SpbData *const sd = (SpbData *const)(w->data);
   const void *data = NULL;
 
   switch (dequeue_cmd(&data, sd)) {
@@ -531,7 +545,7 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
 
   case SPB_ASYNC_LISTEN:
     {
-      SocketEntry **se;
+      SocketEntry **se = NULL;
       const int **const fd_ptr = (const int **const)data;
       const int fd = **fd_ptr;
       *fd_ptr = NULL;
@@ -543,7 +557,7 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
 
   case SPB_ASYNC_CLOSE:
     {
-      SocketEntry **se;
+      SocketEntry **se = NULL;
       const int **const fd_ptr = (const int **const)data;
       const int fd = **fd_ptr;
       JLG(se, sd->sockets, fd);
@@ -560,24 +574,29 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
 
   case SPB_ASYNC_ACCEPT:
     {
-      SocketEntry **se;
+      SocketEntry **se = NULL;
       const SocketAction **const sa_ptr = (const SocketAction **const)data;
       SocketAction sa = **sa_ptr;
       *sa_ptr = NULL;
       erl_drv_cond_signal(sd->cond);
       JLG(se, sd->sockets, sa.fd);
       if (NULL != se && LISTEN_SOCKET == (*se)->type) {
-        int rc = 0;
-        Word_t index = 0;
-        ErlDrvTermData **pid_ptr;
-        JLFE(rc, (*se)->socket.listen_socket.acceptors, index);
+        Word_t index = -1;
+        ErlDrvTermData **pid_ptr_found = NULL;
+        ErlDrvTermData **pid_ptr = NULL;
+        /* find the last present index */
+        JLL(pid_ptr_found, (*se)->socket.listen_socket.acceptors, index);
+        if (NULL == pid_ptr_found)
+          index = 0;
+        else
+          index++;
         JLI(pid_ptr, (*se)->socket.listen_socket.acceptors, index);
         ErlDrvTermData *pid = (ErlDrvTermData *)driver_alloc(sizeof(ErlDrvTermData));
         if (NULL == pid)
           driver_failure(sd->port, -1);
-        *pid = sa.pid; /* copy the calling pid into the memory just allocated */
+        *pid = sa.pid;  /* copy the calling pid into the memory just allocated */
         *pid_ptr = pid; /* make the array entry point at the memory allocated */
-        if (0 == index)
+        if (0 == index) /* if we're the first acceptor, enable the watcher */
           ev_io_start(sd->epoller, (*se)->watcher);
       }
       break;
