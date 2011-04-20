@@ -323,9 +323,10 @@ void return_ok_fd(SpbData *const sd, const int fd) {
   sd->ok_fd_spec[7] = 0;
 }
 
-int setnonblock(const int fd) {
+int setnonblock(const int fd) { /* and turn off nagle */
   int flags = fcntl(fd, F_GETFL);
   flags |= O_NONBLOCK;
+  flags |= O_NDELAY;
   return fcntl(fd, F_SETFL, flags);
 }
 
@@ -413,7 +414,7 @@ void socket_listen(SpbData *const sd, Reader *const reader) {
   return_ok_fd(sd, socketlisten);
 }
 
-void socket_close(SpbData *const sd, Reader *const reader, ErlDrvTermData **spec) {
+void socket_close(SpbData *const sd, Reader *const reader) {
   const int64_t *fd64_ptr = NULL;
   if (! read_int64(reader, &fd64_ptr)) {
     return_reader_error(sd, reader);
@@ -424,7 +425,6 @@ void socket_close(SpbData *const sd, Reader *const reader, ErlDrvTermData **spec
   const void **const fd_ptr_ptr = (const void **const)&fd_ptr;
   enqueue_cmd_and_notify(SPB_ASYNC_CLOSE, fd_ptr_ptr, sd);
   await_null(fd_ptr_ptr, sd);
-  *spec = sd->ok_atom_spec;
 }
 
 void socket_accept(SpbData *const sd, Reader *const reader) {
@@ -448,6 +448,69 @@ void socket_accept(SpbData *const sd, Reader *const reader) {
  *  ev_loop callbacks  *
  ***********************/
 
+static void spb_ev_socket_read_cb(EV_P_ ev_io *, int);
+static void spb_ev_listen_cb(EV_P_ ev_io *, int);
+
+SocketEntry *listen_socket_create(const int fd, SpbData *const sd) {
+  SocketEntry *const se = (SocketEntry*)driver_alloc(sizeof(SocketEntry));
+  if (NULL == se)
+    driver_failure(sd->port, -1);
+
+  se->type = LISTEN_SOCKET;
+  se->fd = fd;
+  se->socket.listen_socket.acceptors = (Pvoid_t)NULL;
+
+  se->watcher = (ev_io*)driver_alloc(sizeof(ev_io));
+  if (NULL == se->watcher)
+    driver_failure(sd->port, -1);
+
+  ev_io_init(se->watcher, spb_ev_listen_cb, fd, EV_READ);
+  se->watcher->data = sd;
+
+  return se;
+}
+
+SocketEntry *connected_socket_create(const int fd, ErlDrvTermData pid, SpbData *const sd) {
+  SocketEntry *const se = (SocketEntry*)driver_alloc(sizeof(SocketEntry));
+  if (NULL == se)
+    driver_failure(sd->port, -1);
+
+  se->type = CONNECTED_SOCKET;
+  se->fd = fd;
+  se->socket.connected_socket.pid = pid;
+
+  se->watcher = (ev_io*)driver_alloc(sizeof(ev_io));
+  if (NULL == se->watcher)
+    driver_failure(sd->port, -1);
+
+  ev_io_init(se->watcher, spb_ev_socket_read_cb, fd, EV_READ);
+  se->watcher->data = sd;
+
+  return se;
+}
+
+void socket_entry_destroy(SocketEntry *se, SpbData *const sd) {
+  Word_t freed = 0;
+  switch (se->type) {
+
+  case LISTEN_SOCKET:
+    ev_io_stop(sd->epoller, se->watcher);
+    driver_free(se->watcher);
+    JLFA(freed, se->socket.listen_socket.acceptors);
+    break;
+
+  case CONNECTED_SOCKET:
+    ev_io_stop(sd->epoller, se->watcher);
+    driver_free(se->watcher);
+    break;
+
+  }
+  driver_free(se);
+}
+
+static void spb_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
+}
+
 static void spb_ev_listen_cb(EV_P_ ev_io *w, int revents) {
   SpbData *const sd = (SpbData *const)(w->data);
   struct sockaddr_in client_addr;
@@ -457,7 +520,7 @@ static void spb_ev_listen_cb(EV_P_ ev_io *w, int revents) {
   int rc = 0;
   Word_t index = 0;
   ErlDrvTermData *const *pid = NULL;
-  SocketEntry *const *se = NULL;
+  SocketEntry **se = NULL;
 
   JLG(se, sd->sockets, w->fd); /* find the SocketEntry for w->fd */
   if (NULL != se && LISTEN_SOCKET == (*se)->type) {
@@ -486,45 +549,14 @@ static void spb_ev_listen_cb(EV_P_ ev_io *w, int revents) {
       if (0 == index)
         ev_io_stop(EV_A_ w);
 
-      /* TODO: create CONNECTED_SOCKET entry and store */
+      JLI(se, sd->sockets, client_sd);
+      *se = connected_socket_create(client_sd, **pid, sd);
     } else {
       driver_failure(sd->port, -1);
     }
   } else {
     driver_failure(sd->port, -1);
   }
-}
-
-SocketEntry *listen_socket_create(const int fd, SpbData *const sd) {
-  SocketEntry *const se = (SocketEntry*)driver_alloc(sizeof(SocketEntry));
-  if (NULL == se)
-    driver_failure(sd->port, -1);
-
-  se->type = LISTEN_SOCKET;
-  se->fd = fd;
-  se->socket.listen_socket.acceptors = (Pvoid_t)NULL;
-
-  se->watcher = (ev_io*)driver_alloc(sizeof(ev_io));
-  if (NULL == se->watcher)
-    driver_failure(sd->port, -1);
-
-  ev_io_init(se->watcher, spb_ev_listen_cb, fd, EV_READ);
-  se->watcher->data = sd;
-
-  return se;
-}
-
-void socket_entry_destroy(SocketEntry *se, SpbData *const sd) {
-  Word_t freed = 0;
-  switch (se->type) {
-  case LISTEN_SOCKET:
-    ev_io_stop(sd->epoller, se->watcher);
-    driver_free(se->watcher);
-    JLFA(freed, se->socket.listen_socket.acceptors);
-    break;
-    /* TODO CONNECTED_SOCKET */
-  }
-  driver_free(se);
 }
 
 static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
@@ -563,8 +595,11 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
       JLG(se, sd->sockets, fd);
       if (NULL != se) {
         int rc = 0;
+        if (0 > close(fd))
+          return_socket_error(sd, errno);
+        else
+          driver_send_term(sd->port, sd->pid, sd->ok_atom_spec, ATOM_SPEC_LEN);
         socket_entry_destroy(*se, sd);
-        close(fd);
         JLD(rc, sd->sockets, fd);
       }
       *fd_ptr = NULL;
@@ -810,7 +845,7 @@ static void spb_outputv(ErlDrvData drv_data, ErlIOVec *const ev) {
       break;
 
     case SPB_CLOSE:
-      socket_close(sd, &reader, &spec);
+      socket_close(sd, &reader);
       break;
 
     case SPB_ACCEPT:
