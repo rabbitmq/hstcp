@@ -48,9 +48,10 @@
 
 #define ATOM_SPEC_LEN          8
 #define READER_ERROR_SPEC_LEN  13
-#define SOCKET_ERROR_SPEC_LEN  13
+#define SOCKET_ERROR_SPEC_LEN  15
 #define OK_FD_SPEC_LEN         12
-#define OK_FD_DATA_SPEC_LEN    16
+#define FD_DATA_SPEC_LEN       16
+#define FD_CLOSED_SPEC_LEN     12
 
 #define LISTEN_SOCKET 1
 #define CONNECTED_SOCKET 2
@@ -63,12 +64,28 @@ typedef struct {
 typedef struct {
   ErlDrvPort     port;               /* driver port                                    */
   ErlDrvTermData pid;                /* driver pid                                     */
+
+  /* {'spb_event', Port, 'no_such_command'}                                            */
   ErlDrvTermData *no_such_command_atom_spec;
+
+  /* {'spb_event', Port, 'ok'}                                                         */
   ErlDrvTermData *ok_atom_spec;
+
+  /* {'spb_event', Port, {'reader_error', "string"}}                                   */
   ErlDrvTermData *reader_error_spec; /* terms for errors from reader                   */
+
+  /* {'spb_event', Port, {'socket_error', Fd, "string"}}                               */
   ErlDrvTermData *socket_error_spec; /* terms for errors from socket                   */
+
+  /* {'spb_event', Port, {'ok', Fd}}                                                   */
   ErlDrvTermData *ok_fd_spec;        /* terms for ok results including a fd            */
-  ErlDrvTermData *ok_fd_data_spec;   /* terms for ok results including a fd and data   */
+
+  /* {'spb_event', Port, {'data', Fd, Binary}}                                         */
+  ErlDrvTermData *fd_data_spec;      /* terms for results including a fd and data      */
+
+  /* {'spb_event', Port, {'closed', Fd}}                                               */
+  ErlDrvTermData *fd_closed_spec;    /* terms for sending to a pid on socket close     */
+
   struct ev_loop *epoller;           /* our ev loop                                    */
   ErlDrvTid      tid;                /* the thread running our ev loop                 */
   ev_async       *async_watcher;     /* the async watcher used to talk to our thread   */
@@ -289,20 +306,31 @@ void command_get(Command *cmd, SpbData *const sd) {
  *  Socket Functions  *
  **********************/
 
-void return_socket_error_str_pid(SpbData *const sd, const char* error_str, ErlDrvTermData pid) {
-  sd->socket_error_spec[7] = (ErlDrvTermData)error_str;
-  sd->socket_error_spec[8] = (ErlDrvUInt)strlen(error_str);
+void return_socket_closed_pid(SpbData *const sd, const int fd,
+                              ErlDrvTermData pid) {
+  sd->fd_closed_spec[7] = (ErlDrvSInt)fd;
+  driver_send_term(sd->port, pid, sd->fd_closed_spec, FD_CLOSED_SPEC_LEN);
+  sd->fd_closed_spec[7] = 0;
+}
+
+void return_socket_error_str_pid(SpbData *const sd, const int fd,
+                                 const char* error_str, ErlDrvTermData pid) {
+  sd->socket_error_spec[7] = (ErlDrvSInt)fd;
+  sd->socket_error_spec[9] = (ErlDrvTermData)error_str;
+  sd->socket_error_spec[10] = (ErlDrvUInt)strlen(error_str);
   driver_send_term(sd->port, pid, sd->socket_error_spec, SOCKET_ERROR_SPEC_LEN);
-  sd->socket_error_spec[7] = (ErlDrvTermData)NULL;
-  sd->socket_error_spec[8] = 0;
+  sd->socket_error_spec[7] = (ErlDrvSInt)0;
+  sd->socket_error_spec[9] = (ErlDrvTermData)NULL;
+  sd->socket_error_spec[10] = 0;
 }
 
-void return_socket_error_pid(SpbData *const sd, const int error, ErlDrvTermData pid) {
-  return_socket_error_str_pid(sd, strerror(error), pid);
+void return_socket_error_pid(SpbData *const sd, const int fd, const int error,
+                             ErlDrvTermData pid) {
+  return_socket_error_str_pid(sd, fd, strerror(error), pid);
 }
 
-void return_socket_error(SpbData *const sd, const int error) {
-  return_socket_error_str_pid(sd, strerror(error), sd->pid);
+void return_socket_error(SpbData *const sd, const int fd, const int error) {
+  return_socket_error_str_pid(sd, fd, strerror(error), sd->pid);
 }
 
 void return_ok_fd(SpbData *const sd, const int fd) {
@@ -337,7 +365,7 @@ void socket_listen(SpbData *const sd, Reader *const reader) {
   const int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 
   if (listen_fd < 0) {
-    return_socket_error(sd, errno);
+    return_socket_error(sd, 0, errno);
     return;
   }
 
@@ -361,20 +389,20 @@ void socket_listen(SpbData *const sd, Reader *const reader) {
   driver_free(address_null);
 
   if (0 == inet_aton_res) { /* why does inet_aton return 0 on FAILURE?! */
-    return_socket_error(sd, errno);
+    return_socket_error(sd, 0, errno);
     return;
   }
 
   if (0 > bind(listen_fd,
                (struct sockaddr *)&listen_address,
                sizeof(listen_address))) {
-    return_socket_error(sd, errno);
+    return_socket_error(sd, 0, errno);
     return;
   }
 
   /* listen for incoming connections. set backlog to 128 */
   if (0 > listen(listen_fd, 128)) {
-    return_socket_error(sd, errno);
+    return_socket_error(sd, 0, errno);
     return;
   }
 
@@ -385,13 +413,13 @@ void socket_listen(SpbData *const sd, Reader *const reader) {
                      SO_REUSEADDR,
                      &reuse,
                      sizeof(reuse))) {
-    return_socket_error(sd, errno);
+    return_socket_error(sd, 0, errno);
     return;
   }
 
   /* put socket into nonblocking mode - needed for libev */
   if (0 > setnonblock(listen_fd)) {
-    return_socket_error(sd, errno);
+    return_socket_error(sd, 0, errno);
     return;
   }
 
@@ -527,18 +555,21 @@ static void spb_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
     ErlDrvTermData pid = (*se)->socket.connected_socket.pid;
     int bytes_ready = -1;
 
-    if (ioctl(fd, FIONREAD, &bytes_ready) < 0)
-      return_socket_error_pid(sd, errno, pid);
+    if (ioctl(fd, FIONREAD, &bytes_ready) < 0) {
+      return_socket_error_pid(sd, fd, errno, pid);
+      return;
+    }
 
     if (0 == bytes_ready) {
       ev_io_stop(EV_A_ w);
       if (0 > close(fd))
-        return_socket_error_pid(sd, errno, pid);
+        return_socket_error_pid(sd, fd, errno, pid);
       else
-        return_socket_error_str_pid(sd, "closed", pid);
+        return_socket_closed_pid(sd, fd, pid);
       socket_entry_destroy(*se, sd);
       int rc; /* don't care about the result of the judy delete */
       JLD(rc, sd->sockets, fd);
+
     } else {
       int quota = (*se)->socket.connected_socket.quota;
       int requested = (0 <= quota && quota < bytes_ready) ? quota : bytes_ready;
@@ -551,7 +582,7 @@ static void spb_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
       achieved = recv(fd, binary->orig_bytes, requested, 0);
 
       if (0 > achieved) {
-        return_socket_error_pid(sd, errno, pid);
+        return_socket_error_pid(sd, fd, errno, pid);
         return;
       }
 
@@ -561,13 +592,13 @@ static void spb_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
           driver_failure(sd->port, -1);
       }
 
-      sd->ok_fd_data_spec[7] = fd;
-      sd->ok_fd_data_spec[9] = (ErlDrvTermData)binary;
-      sd->ok_fd_data_spec[10] = (ErlDrvUInt)achieved;
-      driver_send_term(sd->port, pid, sd->ok_fd_data_spec, OK_FD_DATA_SPEC_LEN);
-      sd->ok_fd_data_spec[7] = 0;
-      sd->ok_fd_data_spec[9] = (ErlDrvTermData)NULL;
-      sd->ok_fd_data_spec[10] = (ErlDrvUInt)0;
+      sd->fd_data_spec[7] = fd;
+      sd->fd_data_spec[9] = (ErlDrvTermData)binary;
+      sd->fd_data_spec[10] = (ErlDrvUInt)achieved;
+      driver_send_term(sd->port, pid, sd->fd_data_spec, FD_DATA_SPEC_LEN);
+      sd->fd_data_spec[7] = 0;
+      sd->fd_data_spec[9] = (ErlDrvTermData)NULL;
+      sd->fd_data_spec[10] = (ErlDrvUInt)0;
       driver_free_binary(binary);
 
       if (0 < quota) {
@@ -681,9 +712,9 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
       JLG(se, sd->sockets, fd);
       if (NULL != se) {
         if (0 > close(fd))
-          return_socket_error(sd, errno);
+          return_socket_error(sd, fd, errno);
         else
-          driver_send_term(sd->port, sd->pid, sd->ok_atom_spec, ATOM_SPEC_LEN);
+          return_socket_closed_pid(sd, fd, sd->pid);
         socket_entry_destroy(*se, sd);
         int rc = 0; /* don't care about the result of the judy delete */
         JLD(rc, sd->sockets, fd);
@@ -812,7 +843,7 @@ static ErlDrvData spb_start(const ErlDrvPort port, char *const buff) {
     return ERL_DRV_ERROR_GENERAL;
 
   sd->no_such_command_atom_spec[0] = ERL_DRV_ATOM;
-  sd->no_such_command_atom_spec[1] = driver_mk_atom("spb_reply");
+  sd->no_such_command_atom_spec[1] = driver_mk_atom("spb_event");
   sd->no_such_command_atom_spec[2] = ERL_DRV_PORT;
   sd->no_such_command_atom_spec[3] = driver_mk_port(port);
   sd->no_such_command_atom_spec[4] = ERL_DRV_ATOM;
@@ -827,7 +858,7 @@ static ErlDrvData spb_start(const ErlDrvPort port, char *const buff) {
     return ERL_DRV_ERROR_GENERAL;
 
   sd->ok_atom_spec[0] = ERL_DRV_ATOM;
-  sd->ok_atom_spec[1] = driver_mk_atom("spb_reply");
+  sd->ok_atom_spec[1] = driver_mk_atom("spb_event");
   sd->ok_atom_spec[2] = ERL_DRV_PORT;
   sd->ok_atom_spec[3] = driver_mk_port(port);
   sd->ok_atom_spec[4] = ERL_DRV_ATOM;
@@ -842,7 +873,7 @@ static ErlDrvData spb_start(const ErlDrvPort port, char *const buff) {
     return ERL_DRV_ERROR_GENERAL;
 
   sd->reader_error_spec[0] = ERL_DRV_ATOM;
-  sd->reader_error_spec[1] = driver_mk_atom("spb_reply");
+  sd->reader_error_spec[1] = driver_mk_atom("spb_event");
   sd->reader_error_spec[2] = ERL_DRV_PORT;
   sd->reader_error_spec[3] = driver_mk_port(port);
   sd->reader_error_spec[4] = ERL_DRV_ATOM;
@@ -862,18 +893,20 @@ static ErlDrvData spb_start(const ErlDrvPort port, char *const buff) {
     return ERL_DRV_ERROR_GENERAL;
 
   sd->socket_error_spec[0] = ERL_DRV_ATOM;
-  sd->socket_error_spec[1] = driver_mk_atom("spb_reply");
+  sd->socket_error_spec[1] = driver_mk_atom("spb_event");
   sd->socket_error_spec[2] = ERL_DRV_PORT;
   sd->socket_error_spec[3] = driver_mk_port(port);
   sd->socket_error_spec[4] = ERL_DRV_ATOM;
   sd->socket_error_spec[5] = driver_mk_atom("socket_error");
-  sd->socket_error_spec[6] = ERL_DRV_STRING;
-  sd->socket_error_spec[7] = (ErlDrvTermData)NULL;
-  sd->socket_error_spec[8] = 0;
-  sd->socket_error_spec[9] = ERL_DRV_TUPLE;
-  sd->socket_error_spec[10] = 2;
+  sd->socket_error_spec[6] = ERL_DRV_INT;
+  sd->socket_error_spec[7] = (ErlDrvSInt)0;
+  sd->socket_error_spec[8] = ERL_DRV_STRING;
+  sd->socket_error_spec[9] = (ErlDrvTermData)NULL;
+  sd->socket_error_spec[10] = 0;
   sd->socket_error_spec[11] = ERL_DRV_TUPLE;
   sd->socket_error_spec[12] = 3;
+  sd->socket_error_spec[13] = ERL_DRV_TUPLE;
+  sd->socket_error_spec[14] = 3;
 
   sd->ok_fd_spec = (ErlDrvTermData*)
     driver_alloc(OK_FD_SPEC_LEN * sizeof(ErlDrvTermData));
@@ -882,7 +915,7 @@ static ErlDrvData spb_start(const ErlDrvPort port, char *const buff) {
     return ERL_DRV_ERROR_GENERAL;
 
   sd->ok_fd_spec[0] = ERL_DRV_ATOM;
-  sd->ok_fd_spec[1] = driver_mk_atom("spb_reply");
+  sd->ok_fd_spec[1] = driver_mk_atom("spb_event");
   sd->ok_fd_spec[2] = ERL_DRV_PORT;
   sd->ok_fd_spec[3] = driver_mk_port(port);
   sd->ok_fd_spec[4] = ERL_DRV_ATOM;
@@ -894,28 +927,47 @@ static ErlDrvData spb_start(const ErlDrvPort port, char *const buff) {
   sd->ok_fd_spec[10] = ERL_DRV_TUPLE;
   sd->ok_fd_spec[11] = 3;
 
-  sd->ok_fd_data_spec = (ErlDrvTermData*)
-    driver_alloc(OK_FD_DATA_SPEC_LEN * sizeof(ErlDrvTermData));
+  sd->fd_data_spec = (ErlDrvTermData*)
+    driver_alloc(FD_DATA_SPEC_LEN * sizeof(ErlDrvTermData));
 
-  if (NULL == sd->ok_fd_data_spec)
+  if (NULL == sd->fd_data_spec)
     return ERL_DRV_ERROR_GENERAL;
 
-  sd->ok_fd_data_spec[0] = ERL_DRV_ATOM;
-  sd->ok_fd_data_spec[1] = driver_mk_atom("spb_reply");
-  sd->ok_fd_data_spec[2] = ERL_DRV_PORT;
-  sd->ok_fd_data_spec[3] = driver_mk_port(port);
-  sd->ok_fd_data_spec[4] = ERL_DRV_ATOM;
-  sd->ok_fd_data_spec[5] = driver_mk_atom("ok");
-  sd->ok_fd_data_spec[6] = ERL_DRV_INT;
-  sd->ok_fd_data_spec[7] = (ErlDrvSInt)0;
-  sd->ok_fd_data_spec[8] = ERL_DRV_BINARY;
-  sd->ok_fd_data_spec[9] = (ErlDrvTermData)NULL;
-  sd->ok_fd_data_spec[10] = (ErlDrvUInt)0;
-  sd->ok_fd_data_spec[11] = (ErlDrvUInt)0;
-  sd->ok_fd_data_spec[12] = ERL_DRV_TUPLE;
-  sd->ok_fd_data_spec[13] = 3;
-  sd->ok_fd_data_spec[14] = ERL_DRV_TUPLE;
-  sd->ok_fd_data_spec[15] = 3;
+  sd->fd_data_spec[0] = ERL_DRV_ATOM;
+  sd->fd_data_spec[1] = driver_mk_atom("spb_event");
+  sd->fd_data_spec[2] = ERL_DRV_PORT;
+  sd->fd_data_spec[3] = driver_mk_port(port);
+  sd->fd_data_spec[4] = ERL_DRV_ATOM;
+  sd->fd_data_spec[5] = driver_mk_atom("data");
+  sd->fd_data_spec[6] = ERL_DRV_INT;
+  sd->fd_data_spec[7] = (ErlDrvSInt)0;
+  sd->fd_data_spec[8] = ERL_DRV_BINARY;
+  sd->fd_data_spec[9] = (ErlDrvTermData)NULL;
+  sd->fd_data_spec[10] = (ErlDrvUInt)0;
+  sd->fd_data_spec[11] = (ErlDrvUInt)0;
+  sd->fd_data_spec[12] = ERL_DRV_TUPLE;
+  sd->fd_data_spec[13] = 3;
+  sd->fd_data_spec[14] = ERL_DRV_TUPLE;
+  sd->fd_data_spec[15] = 3;
+
+  sd->fd_closed_spec = (ErlDrvTermData*)
+    driver_alloc(FD_CLOSED_SPEC_LEN * sizeof(ErlDrvTermData));
+
+  if (NULL == sd->fd_closed_spec)
+    return ERL_DRV_ERROR_GENERAL;
+
+  sd->fd_closed_spec[0] = ERL_DRV_ATOM;
+  sd->fd_closed_spec[1] = driver_mk_atom("spb_event");
+  sd->fd_closed_spec[2] = ERL_DRV_PORT;
+  sd->fd_closed_spec[3] = driver_mk_port(port);
+  sd->fd_closed_spec[4] = ERL_DRV_ATOM;
+  sd->fd_closed_spec[5] = driver_mk_atom("closed");
+  sd->fd_closed_spec[6] = ERL_DRV_INT;
+  sd->fd_closed_spec[7] = (ErlDrvSInt)0;
+  sd->fd_closed_spec[8] = ERL_DRV_TUPLE;
+  sd->fd_closed_spec[9] = 2;
+  sd->fd_closed_spec[10] = ERL_DRV_TUPLE;
+  sd->fd_closed_spec[11] = 3;
 
   /* Note that startup here is a bit surprising: we don't want to
      create the epoller in this thread because if we do then we'll
@@ -958,7 +1010,8 @@ static void spb_stop(const ErlDrvData drv_data) {
   driver_free((char*)sd->reader_error_spec);
   driver_free((char*)sd->socket_error_spec);
   driver_free((char*)sd->ok_fd_spec);
-  driver_free((char*)sd->ok_fd_data_spec);
+  driver_free((char*)sd->fd_data_spec);
+  driver_free((char*)sd->fd_closed_spec);
   driver_free((char*)sd->async_watcher);
 
   erl_drv_mutex_destroy(sd->mutex);
