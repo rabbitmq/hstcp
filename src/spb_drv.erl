@@ -17,7 +17,7 @@
 -module(spb_drv).
 
 -export([start/0, stop/1, listen/3, close/2, accept/2, recv/3]).
--export([test/1]).
+-export([spawn_test/1, test/1]).
 
 -define(LIBNAME, "libspb").
 
@@ -26,13 +26,16 @@
 -define(SPB_ACCEPT, 2).
 -define(SPB_RECV,   3).
 
+spawn_test(IpPort) ->
+    spawn(fun () -> test(IpPort) end).
+
 test(IpPort) ->
     {ok, Port} = spb_drv:start(),
     {ok, Fd} = spb_drv:listen("0.0.0.0", IpPort, Port),
     spb_drv:accept(Fd, Port),
     receive
         {spb_reply, Port, {ok, Fd1}} ->
-            spb_drv:recv(-2, Fd1, Port),
+            spb_drv:recv(all, Fd1, Port),
             Result = drain(Fd1, Port, now(), 0, 0),
             spb_drv:close(Fd, Port),
             spb_drv:stop(Port),
@@ -41,6 +44,7 @@ test(IpPort) ->
 drain(Fd, Port, Start, Count, Size) ->
     receive
         {spb_reply, Port, {ok, Fd, Data}} ->
+            %%spb_drv:recv(once, Fd, Port),
             drain(Fd, Port, Start, Count+1, Size + size(Data));
         Err ->
             Elapsed = timer:now_diff(now(), Start),
@@ -77,14 +81,16 @@ close(Fd, Port) ->
 accept(Fd, Port) ->
     port_command(Port, <<?SPB_ACCEPT, Fd:64/native-signed>>).
 
-%% negative values of Bytes have magic meanings!
-%% -2 => always receive everything and send on to me.
-%% -1 => grab the next data available on the socket, send back, but then recv no more.
-%%  0 => stop receiving more from the socket
-%% >0 => receive from socket and send to us, until we've received that many number of bytes.
+recv(all, Fd, Port) ->
+    recv1(-2, Fd, Port);
+recv(once, Fd, Port) ->
+    recv1(-1, Fd, Port);
 recv(Bytes, Fd, Port) ->
+    recv1(Bytes, Fd, Port).
+
+recv1(N, Fd, Port) ->
     port_command(
-      Port, <<?SPB_RECV, Fd:64/native-signed, Bytes:64/native-signed>>).
+      Port, <<?SPB_RECV, Fd:64/native-signed, N:64/native-signed>>).
 
 %% ---------------------------------------------------------------------------
 

@@ -661,104 +661,127 @@ static void spb_ev_listen_cb(EV_P_ ev_io *w, int revents) {
 static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
   SpbData *const sd = (SpbData *const)(w->data);
   const void *data = NULL;
+  uint8_t cmd = dequeue_cmd(&data, sd);
+  /* Multiple ev async events can be combined by ev. Thus we need to
+     walk the queue of commands and process them all rather than just
+     the next one */
+  while (SPB_ASYNC_UNDEFINED != cmd) {
+    switch (cmd) {
 
-  switch (dequeue_cmd(&data, sd)) {
-
-  case SPB_ASYNC_START:
-    driver_send_term(sd->port, sd->pid, sd->ok_atom_spec, ATOM_SPEC_LEN);
-    break;
-
-  case SPB_ASYNC_EXIT:
-    ev_async_stop(EV_A_ w);
-    ev_unloop(EV_A_ EVUNLOOP_ALL);
-    ev_loop_destroy(EV_A);
-    break;
-
-  case SPB_ASYNC_LISTEN:
-    {
-      SocketEntry **se = NULL;
-      const int **const fd_ptr = (const int **const)data;
-      const int fd = **fd_ptr;
-      *fd_ptr = NULL;
-      erl_drv_cond_signal(sd->cond); /* release the emulator thread - just bookkeeping left */
-      JLI(se, sd->sockets, fd);
-      *se = listen_socket_create(fd, sd);
+    case SPB_ASYNC_START:
+      driver_send_term(sd->port, sd->pid, sd->ok_atom_spec, ATOM_SPEC_LEN);
       break;
-    }
 
-  case SPB_ASYNC_CLOSE: /* note the same close code is used for listening and connected sockets */
-    {
-      SocketEntry **se = NULL;
-      const int **const fd_ptr = (const int **const)data;
-      const int fd = **fd_ptr;
-      JLG(se, sd->sockets, fd);
-      if (NULL != se) {
-        int rc = 0;
-        if (0 > close(fd))
-          return_socket_error(sd, errno);
-        else
+    case SPB_ASYNC_EXIT:
+      ev_async_stop(EV_A_ w);
+      ev_unloop(EV_A_ EVUNLOOP_ALL);
+      ev_loop_destroy(EV_A);
+      break;
+
+    case SPB_ASYNC_LISTEN:
+      {
+        SocketEntry **se = NULL;
+        const int **const fd_ptr = (const int **const)data;
+        const int fd = **fd_ptr;
+        erl_drv_mutex_lock(sd->mutex);
+        *fd_ptr = NULL;
+        erl_drv_cond_signal(sd->cond); /* release the emulator thread
+                                          - just bookkeeping left */
+        erl_drv_mutex_unlock(sd->mutex);
+        JLI(se, sd->sockets, fd);
+        *se = listen_socket_create(fd, sd);
+        break;
+      }
+
+    case SPB_ASYNC_CLOSE: /* note the same close code is used for
+                             listening and connected sockets */
+      {
+        SocketEntry **se = NULL;
+        const int **const fd_ptr = (const int **const)data;
+        const int fd = **fd_ptr;
+        JLG(se, sd->sockets, fd);
+        if (NULL != se) {
+          int rc = 0;
+          if (0 > close(fd))
+            return_socket_error(sd, errno);
+          else
+            driver_send_term(sd->port, sd->pid, sd->ok_atom_spec,
+                             ATOM_SPEC_LEN);
+          socket_entry_destroy(*se, sd);
+          JLD(rc, sd->sockets, fd);
+        } else {
+          /* programmer messed up, but just ignore it for the time being */
           driver_send_term(sd->port, sd->pid, sd->ok_atom_spec, ATOM_SPEC_LEN);
-        socket_entry_destroy(*se, sd);
-        JLD(rc, sd->sockets, fd);
-      } else {
-        /* programmer messed up, but just ignore it for the time being */
-        driver_send_term(sd->port, sd->pid, sd->ok_atom_spec, ATOM_SPEC_LEN);
+        }
+        /* Only now release the emulator thread */
+        erl_drv_mutex_lock(sd->mutex);
+        *fd_ptr = NULL;
+        erl_drv_cond_signal(sd->cond);
+        erl_drv_mutex_unlock(sd->mutex);
+        break;
       }
-      /* Only now release the emulator thread */
-      *fd_ptr = NULL;
-      erl_drv_cond_signal(sd->cond);
-      break;
+
+    case SPB_ASYNC_ACCEPT:
+      {
+        SocketEntry **se = NULL;
+        const SocketAction **const sa_ptr = (const SocketAction **const)data;
+        SocketAction sa = **sa_ptr;
+        erl_drv_mutex_lock(sd->mutex);
+        *sa_ptr = NULL; /* release the emulator thread - we've copied
+                           out everything we need */
+        erl_drv_cond_signal(sd->cond);
+        erl_drv_mutex_unlock(sd->mutex);
+        JLG(se, sd->sockets, sa.fd);
+        if (NULL != se && LISTEN_SOCKET == (*se)->type) {
+          Word_t index = -1;
+          ErlDrvTermData **pid_ptr_found = NULL;
+          ErlDrvTermData **pid_ptr = NULL;
+          /* find the last present index in the list of acceptors */
+          JLL(pid_ptr_found, (*se)->socket.listen_socket.acceptors, index);
+          if (NULL == pid_ptr_found)
+            index = 0;
+          else
+            ++index;
+          JLI(pid_ptr, (*se)->socket.listen_socket.acceptors, index);
+          ErlDrvTermData *pid =
+            (ErlDrvTermData *)driver_alloc(sizeof(ErlDrvTermData));
+          if (NULL == pid)
+            driver_failure(sd->port, -1);
+          *pid = sa.pid;  /* copy the calling pid into the memory just
+                             allocated */
+          *pid_ptr = pid; /* make the array entry point at the memory
+                             allocated */
+          if (0 == index) /* if we're the first acceptor, enable the
+                             watcher */
+            ev_io_start(sd->epoller, (*se)->watcher);
+        }
+        break;
+      }
+
+    case SPB_ASYNC_RECV:
+      {
+        SocketEntry **se = NULL;
+        const SocketAction **const sa_ptr = (const SocketAction **const)data;
+        SocketAction sa = **sa_ptr;
+        erl_drv_mutex_lock(sd->mutex);
+        *sa_ptr = NULL; /* release the emulator thread - we've copied
+                           out everything we need */
+        erl_drv_cond_signal(sd->cond);
+        erl_drv_mutex_unlock(sd->mutex);
+        JLG(se, sd->sockets, sa.fd);
+        if (NULL != se && CONNECTED_SOCKET == (*se)->type) {
+          int64_t old_quota = (*se)->socket.connected_socket.quota;
+          (*se)->socket.connected_socket.quota = sa.value;
+          if (0 == sa.value && 0 != old_quota)
+            ev_io_stop(sd->epoller, (*se)->watcher);
+          else if (0 != sa.value && 0 == old_quota)
+            ev_io_start(sd->epoller, (*se)->watcher);
+        }
+        break;
+      }
     }
 
-  case SPB_ASYNC_ACCEPT:
-    {
-      SocketEntry **se = NULL;
-      const SocketAction **const sa_ptr = (const SocketAction **const)data;
-      SocketAction sa = **sa_ptr;
-      *sa_ptr = NULL; /* release the emulator thread - we've copied out everything we need */
-      erl_drv_cond_signal(sd->cond);
-      JLG(se, sd->sockets, sa.fd);
-      if (NULL != se && LISTEN_SOCKET == (*se)->type) {
-        Word_t index = -1;
-        ErlDrvTermData **pid_ptr_found = NULL;
-        ErlDrvTermData **pid_ptr = NULL;
-        /* find the last present index in the list of acceptors */
-        JLL(pid_ptr_found, (*se)->socket.listen_socket.acceptors, index);
-        if (NULL == pid_ptr_found)
-          index = 0;
-        else
-          ++index;
-        JLI(pid_ptr, (*se)->socket.listen_socket.acceptors, index);
-        ErlDrvTermData *pid = (ErlDrvTermData *)driver_alloc(sizeof(ErlDrvTermData));
-        if (NULL == pid)
-          driver_failure(sd->port, -1);
-        *pid = sa.pid;  /* copy the calling pid into the memory just allocated */
-        *pid_ptr = pid; /* make the array entry point at the memory allocated */
-        if (0 == index) /* if we're the first acceptor, enable the watcher */
-          ev_io_start(sd->epoller, (*se)->watcher);
-      }
-      break;
-    }
-
-  case SPB_ASYNC_RECV:
-    {
-      SocketEntry **se = NULL;
-      const SocketAction **const sa_ptr = (const SocketAction **const)data;
-      SocketAction sa = **sa_ptr;
-      *sa_ptr = NULL; /* release the emulator thread - we've copied out everything we need */
-      erl_drv_cond_signal(sd->cond);
-      JLG(se, sd->sockets, sa.fd);
-      if (NULL != se && CONNECTED_SOCKET == (*se)->type) {
-        int64_t old_quota = (*se)->socket.connected_socket.quota;
-        (*se)->socket.connected_socket.quota = sa.value;
-        if (0 == sa.value && 0 != old_quota)
-          ev_io_stop(sd->epoller, (*se)->watcher);
-        else if (0 != sa.value && 0 == old_quota)
-          ev_io_start(sd->epoller, (*se)->watcher);
-      }
-      break;
-    }
-
+    cmd = dequeue_cmd(&data, sd); /* grab the next command */
   }
 }
 
@@ -784,12 +807,10 @@ static void *spb_ev_start(void *arg) {
   sd->async_watcher->data = sd;
   ev_async_start(sd->epoller, sd->async_watcher);
 
-  erl_drv_mutex_unlock(sd->mutex);
   erl_drv_cond_signal(sd->cond);
+  erl_drv_mutex_unlock(sd->mutex);
 
-  printf("poller started\r\n");
   ev_loop(sd->epoller, 0);
-  printf("poller stopping\r\n");
   return NULL;
 }
 
