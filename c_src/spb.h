@@ -37,13 +37,12 @@ enum _ReaderError {
 typedef enum _ReaderError ReaderError;
 
 enum _AsyncCommandType {
-  SPB_ASYNC_UNDEFINED = 0,
-  SPB_ASYNC_START     = 1,
-  SPB_ASYNC_EXIT      = 2,
-  SPB_ASYNC_LISTEN    = 3,
-  SPB_ASYNC_CLOSE     = 4,
-  SPB_ASYNC_ACCEPT    = 5,
-  SPB_ASYNC_RECV      = 6
+  SPB_ASYNC_START     = 0,
+  SPB_ASYNC_EXIT      = 1,
+  SPB_ASYNC_LISTEN    = 2,
+  SPB_ASYNC_CLOSE     = 3,
+  SPB_ASYNC_ACCEPT    = 4,
+  SPB_ASYNC_RECV      = 5
 };
 typedef enum _AsyncCommandType AsyncCommandType;
 
