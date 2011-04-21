@@ -33,20 +33,19 @@ test(IpPort) ->
     receive
         {spb_reply, Port, {ok, Fd1}} ->
             spb_drv:recv(-2, Fd1, Port),
-            Result = drain(Fd1, Port, 0, 0),
+            Result = drain(Fd1, Port, now(), 0, 0),
             spb_drv:close(Fd, Port),
             spb_drv:stop(Port),
             Result
     end.
-drain(Fd, Port, Count, Size) ->
-    case Count rem 1000 of
-        0 -> io:format("~p~n", [Size]);
-        _ -> ok
-    end,
+drain(Fd, Port, Start, Count, Size) ->
     receive
         {spb_reply, Port, {ok, Fd, Data}} ->
-            drain(Fd, Port, Count+1, Size + size(Data));
+            drain(Fd, Port, Start, Count+1, Size + size(Data));
         Err ->
+            Elapsed = timer:now_diff(now(), Start),
+            io:format("received ~p bytes, in ~p msgs, in ~p microseconds (~p bytes/sec)~n",
+                      [Size, Count, Elapsed, (Size*1000000)/Elapsed]),
             spb_drv:close(Fd, Port),
             {Err, Count, Size}
     end.
