@@ -32,26 +32,28 @@ spawn_test(IpPort) ->
 test(IpPort) ->
     {ok, Port} = spb_drv:start(),
     {ok, Fd} = spb_drv:listen("0.0.0.0", IpPort, Port),
-    spb_drv:accept(Fd, Port),
+    {ok, Fd} = spb_drv:accept(Fd, Port),
     receive
         {spb_event, Port, {ok, Fd1}} ->
-            spb_drv:recv(all, Fd1, Port),
+            ok = spb_drv:recv(all, Fd1, Port),
             Result = drain(Fd1, Port, now(), 0, 0),
-            spb_drv:close(Fd, Port),
-            spb_drv:stop(Port),
+            {closed, Fd} = spb_drv:close(Fd, Port),
+            ok = spb_drv:stop(Port),
             Result
     end.
 drain(Fd, Port, Start, Count, Size) ->
     receive
         {spb_event, Port, {data, Fd, Data}} ->
-            %%spb_drv:recv(once, Fd, Port),
+            %%ok = spb_drv:recv(once, Fd, Port),
             drain(Fd, Port, Start, Count+1, Size + size(Data));
-        Err ->
+        {spb_event, Port, Event} ->
             Elapsed = timer:now_diff(now(), Start),
             io:format("received ~p bytes, in ~p msgs, in ~p microseconds (~p bytes/sec)~n",
                       [Size, Count, Elapsed, (Size*1000000)/Elapsed]),
-            spb_drv:close(Fd, Port),
-            {Err, Count, Size}
+            {ClosedOrBadArg, Fd} = spb_drv:close(Fd, Port),
+            %% ASSERTION: badarg if it's already been closed
+            true = ClosedOrBadArg =:= closed orelse ClosedOrBadArg =:= badarg,
+            {Event, Count, Size}
     end.
 
 start() ->
@@ -81,7 +83,7 @@ close(Fd, Port) ->
 
 accept(Fd, Port) ->
     true = port_command(Port, <<?SPB_ACCEPT, Fd:64/native-signed>>),
-    ok.
+    simple_reply(Port).
 
 recv(all, Fd, Port) ->
     recv1(-2, Fd, Port);
