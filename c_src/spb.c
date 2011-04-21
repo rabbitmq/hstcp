@@ -319,24 +319,24 @@ int setnonblock(const int fd) { /* and turn off nagle */
 }
 
 void socket_listen(SpbData *const sd, Reader *const reader) {
-  const int reuse = 1;
   const char *address = NULL;
   const uint64_t *address_len = NULL;
-  const uint16_t *port;
 
   if (! read_binary(reader, &address, &address_len)) {
     return_reader_error(sd, reader);
     return;
   }
+
+  const uint16_t *port;
   if (! read_uint16(reader, &port)) {
     return_reader_error(sd, reader);
     return;
   }
 
-  struct sockaddr_in addresslisten;
-  const int socketlisten = socket(AF_INET, SOCK_STREAM, 0);
+  struct sockaddr_in listen_address;
+  const int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 
-  if (socketlisten < 0) {
+  if (listen_fd < 0) {
     return_socket_error(sd, errno);
     return;
   }
@@ -344,42 +344,43 @@ void socket_listen(SpbData *const sd, Reader *const reader) {
   /* strings coming from Erlang are not zero terminated, and the
      length won't include the 0 stop byte, so copy into a new array,
      ensuring we have a stop byte at the end. */
-  char *const address2 = (char*) driver_alloc((*address_len)+1);
-  if (NULL == address2) {
+  char *const address_null = (char*) driver_alloc((*address_len)+1);
+  if (NULL == address_null) {
     return_reader_error(sd, reader);
     return;
   }
 
-  address2[(*address_len)] = '\0';
-  strncpy(address2, address, *address_len);
+  address_null[(*address_len)] = '\0';
+  strncpy(address_null, address, *address_len);
 
-  memset(&addresslisten, 0, sizeof(addresslisten));
+  memset(&listen_address, 0, sizeof(listen_address));
 
-  addresslisten.sin_family = AF_INET;
-  addresslisten.sin_port = htons(*port);
-  const int inet_aton_res = inet_aton(address2, &(addresslisten.sin_addr));
-  driver_free(address2);
+  listen_address.sin_family = AF_INET;
+  listen_address.sin_port = htons(*port);
+  const int inet_aton_res = inet_aton(address_null, &(listen_address.sin_addr));
+  driver_free(address_null);
 
   if (0 == inet_aton_res) { /* why does inet_aton return 0 on FAILURE?! */
     return_socket_error(sd, errno);
     return;
   }
 
-  if (0 > bind(socketlisten,
-               (struct sockaddr *)&addresslisten,
-               sizeof(addresslisten))) {
+  if (0 > bind(listen_fd,
+               (struct sockaddr *)&listen_address,
+               sizeof(listen_address))) {
     return_socket_error(sd, errno);
     return;
   }
 
   /* listen for incoming connections. set backlog to 128 */
-  if (0 > listen(socketlisten, 128)) {
+  if (0 > listen(listen_fd, 128)) {
     return_socket_error(sd, errno);
     return;
   }
 
+  const int reuse = 1;
   /* turn on reuseaddr */
-  if (0 > setsockopt(socketlisten,
+  if (0 > setsockopt(listen_fd,
                      SOL_SOCKET,
                      SO_REUSEADDR,
                      &reuse,
@@ -389,17 +390,17 @@ void socket_listen(SpbData *const sd, Reader *const reader) {
   }
 
   /* put socket into nonblocking mode - needed for libev */
-  if (0 > setnonblock(socketlisten)) {
+  if (0 > setnonblock(listen_fd)) {
     return_socket_error(sd, errno);
     return;
   }
 
-  const int *socketlisten_ptr = &socketlisten;
-  const void **const socketlisten_ptr_ptr = (const void **const)&socketlisten_ptr;
-  command_set_and_notify(SPB_ASYNC_LISTEN, socketlisten_ptr_ptr, sd);
-  await_null(socketlisten_ptr_ptr, sd);
+  const int *listen_fd_ptr = &listen_fd;
+  const void **const listen_fd_ptr_ptr = (const void **const)&listen_fd_ptr;
+  command_set_and_notify(SPB_ASYNC_LISTEN, listen_fd_ptr_ptr, sd);
+  await_null(listen_fd_ptr_ptr, sd);
 
-  return_ok_fd(sd, socketlisten);
+  return_ok_fd(sd, listen_fd);
 }
 
 void socket_close(SpbData *const sd, Reader *const reader) {
@@ -421,10 +422,9 @@ void socket_accept(SpbData *const sd, Reader *const reader) {
     return_reader_error(sd, reader);
     return;
   }
-  ErlDrvTermData caller = sd->pid;
   SocketAction sa;
   sa.fd = (int)*fd64_ptr;
-  sa.pid = caller;
+  sa.pid = sd->pid;
   sa.value = 0;
   const SocketAction *sa_ptr = &sa;
   const void **sa_ptr_ptr = (const void **)&sa_ptr;
@@ -439,10 +439,9 @@ void socket_recv(SpbData *const sd, Reader *const reader) {
     return_reader_error(sd, reader);
     return;
   }
-  ErlDrvTermData caller = sd->pid;
   SocketAction sa;
   sa.fd = (int)*fd64_ptr;
-  sa.pid = caller;
+  sa.pid = sd->pid;
   sa.value = *bytes_ptr;
   const SocketAction *sa_ptr = &sa;
   const void **sa_ptr_ptr = (const void **)&sa_ptr;
@@ -498,7 +497,7 @@ SocketEntry *connected_socket_create(const int fd, ErlDrvTermData pid, SpbData *
 }
 
 void socket_entry_destroy(SocketEntry *se, SpbData *const sd) {
-  Word_t freed = 0;
+  Word_t freed = 0; /* don't actually care about how many bytes judy frees up */
   ev_io_stop(sd->epoller, se->watcher);
   driver_free(se->watcher);
 
@@ -518,45 +517,53 @@ void socket_entry_destroy(SocketEntry *se, SpbData *const sd) {
 }
 
 static void spb_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
-  SocketEntry **se = NULL;
   SpbData *const sd = (SpbData *const)(w->data);
   const int fd = w->fd;
-  int size = 0;
-  ssize_t read = 0;
-  int ready = -1;
+  SocketEntry **se = NULL;
+
   JLG(se, sd->sockets, w->fd); /* find the SocketEntry for fd */
 
   if (NULL != se && CONNECTED_SOCKET == (*se)->type) {
-    int quota = (*se)->socket.connected_socket.quota;
     ErlDrvTermData pid = (*se)->socket.connected_socket.pid;
+    int bytes_ready = -1;
 
-    if (ioctl(fd, FIONREAD, &ready) < 0)
+    if (ioctl(fd, FIONREAD, &bytes_ready) < 0)
       return_socket_error_pid(sd, errno, pid);
 
-    if (0 == ready) {
+    if (0 == bytes_ready) {
       ev_io_stop(EV_A_ w);
       if (0 > close(fd))
         return_socket_error_pid(sd, errno, pid);
       else
         return_socket_error_str_pid(sd, "closed", pid);
       socket_entry_destroy(*se, sd);
-      JLD(ready, sd->sockets, fd);
+      int rc; /* don't care about the result of the judy delete */
+      JLD(rc, sd->sockets, fd);
     } else {
-      size = (0 <= quota && quota < ready) ? quota : ready;
-      ErlDrvBinary *binary = driver_alloc_binary(size);
+      int quota = (*se)->socket.connected_socket.quota;
+      int requested = (0 <= quota && quota < bytes_ready) ? quota : bytes_ready;
+      ssize_t achieved = 0;
+
+      ErlDrvBinary *binary = driver_alloc_binary(requested);
       if (NULL == binary)
         driver_failure(sd->port, -1);
 
-      read = recv(fd, binary->orig_bytes, size, 0);
-      if (read < size) {
-        binary = driver_realloc_binary(binary, read);
+      achieved = recv(fd, binary->orig_bytes, requested, 0);
+
+      if (0 > achieved) {
+        return_socket_error_pid(sd, errno, pid);
+        return;
+      }
+
+      if (achieved < requested) {
+        binary = driver_realloc_binary(binary, achieved);
         if (NULL == binary)
           driver_failure(sd->port, -1);
       }
 
       sd->ok_fd_data_spec[7] = fd;
       sd->ok_fd_data_spec[9] = (ErlDrvTermData)binary;
-      sd->ok_fd_data_spec[10] = (ErlDrvUInt)read;
+      sd->ok_fd_data_spec[10] = (ErlDrvUInt)achieved;
       driver_send_term(sd->port, pid, sd->ok_fd_data_spec, OK_FD_DATA_SPEC_LEN);
       sd->ok_fd_data_spec[7] = 0;
       sd->ok_fd_data_spec[9] = (ErlDrvTermData)NULL;
@@ -564,9 +571,9 @@ static void spb_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
       driver_free_binary(binary);
 
       if (0 < quota) {
-        if (read == quota)
+        if (achieved == quota)
           ev_io_stop(EV_A_ w);
-        (*se)->socket.connected_socket.quota -= read;
+        (*se)->socket.connected_socket.quota -= achieved;
       } else if (-1 == quota) {
         ev_io_stop(EV_A_ w);
         (*se)->socket.connected_socket.quota = 0;
@@ -582,48 +589,51 @@ static void spb_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
 
 static void spb_ev_listen_cb(EV_P_ ev_io *w, int revents) {
   SpbData *const sd = (SpbData *const)(w->data);
-  struct sockaddr_in client_addr;
-  socklen_t client_len;
-  int client_sd;
-
-  int rc = 0;
-  Word_t index = 0;
-  ErlDrvTermData *const *pid_ptr = NULL;
-  ErlDrvTermData pid;
+  const int fd = w->fd;
   SocketEntry **se = NULL;
 
-  JLG(se, sd->sockets, w->fd); /* find the SocketEntry for w->fd */
+  JLG(se, sd->sockets, fd); /* find the SocketEntry for fd */
+
   if (NULL != se && LISTEN_SOCKET == (*se)->type) {
+    ErlDrvTermData *const *pid_ptr = NULL;
+    Word_t index = 0;
+
     /* find first entry in acceptors */
     JLBC(pid_ptr, (*se)->socket.listen_socket.acceptors, 1, index);
 
     if (NULL != pid_ptr) {
-      pid = **pid_ptr;       /* copy out pid */
+      const ErlDrvTermData pid = **pid_ptr; /* copy out pid */
       driver_free(*pid_ptr); /* was allocated in SPB_ASYNC_ACCEPT */
-      /* delete that entry from acceptors */
+
+      int rc = 0; /* delete that entry from acceptors */
       JLD(rc, (*se)->socket.listen_socket.acceptors, index);
+
+      struct sockaddr_in client_addr;
+      socklen_t client_len;
 
       client_len = sizeof(client_addr);
       memset(&client_addr, 0, client_len);
-      client_sd = accept(w->fd, (struct sockaddr *)&client_addr, &client_len);
+      const int accepted_fd =
+        accept(fd, (struct sockaddr *)&client_addr, &client_len);
 
-      if (0 > setnonblock(client_sd)) {
+      if (0 > setnonblock(accepted_fd)) {
         perror("Cannot set socket non-blocking\r\n");
         driver_failure(sd->port, -1);
       }
 
-      sd->ok_fd_spec[7] = client_sd;
+      sd->ok_fd_spec[7] = accepted_fd;
       driver_send_term(sd->port, pid, sd->ok_fd_spec, OK_FD_SPEC_LEN);
       sd->ok_fd_spec[7] = 0;
 
       /* figure out if there are more pending acceptors */
-      JLC(index, (*se)->socket.listen_socket.acceptors, 0, -1);
-      if (0 == index)
+      pid_ptr = NULL;
+      JLBC(pid_ptr, (*se)->socket.listen_socket.acceptors, 1, index);
+      if (NULL == pid_ptr)
         ev_io_stop(EV_A_ w);
 
       se = NULL;
-      JLI(se, sd->sockets, client_sd);
-      *se = connected_socket_create(client_sd, pid, sd);
+      JLI(se, sd->sockets, accepted_fd);
+      *se = connected_socket_create(accepted_fd, pid, sd);
 
     } else {
       perror("Accepted a connection, but no acceptor ready\r\n");
@@ -653,10 +663,10 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
 
   case SPB_ASYNC_LISTEN:
     {
-      SocketEntry **se = NULL;
       const int **const fd_ptr = (const int **const)command.data;
       const int fd = **fd_ptr;
       set_null_and_signal((const void **const)fd_ptr, sd);
+      SocketEntry **se = NULL;
       JLI(se, sd->sockets, fd);
       *se = listen_socket_create(fd, sd);
       break;
@@ -665,17 +675,17 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
   case SPB_ASYNC_CLOSE: /* note the same close code is used for
                            listening and connected sockets */
     {
-      SocketEntry **se = NULL;
       const int **const fd_ptr = (const int **const)command.data;
       const int fd = **fd_ptr;
+      SocketEntry **se = NULL;
       JLG(se, sd->sockets, fd);
       if (NULL != se) {
-        int rc = 0;
         if (0 > close(fd))
           return_socket_error(sd, errno);
         else
           driver_send_term(sd->port, sd->pid, sd->ok_atom_spec, ATOM_SPEC_LEN);
         socket_entry_destroy(*se, sd);
+        int rc = 0; /* don't care about the result of the judy delete */
         JLD(rc, sd->sockets, fd);
       } else {
         /* programmer messed up, but just ignore it for the time being */
@@ -688,33 +698,36 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
 
   case SPB_ASYNC_ACCEPT:
     {
-      SocketEntry **se = NULL;
       const SocketAction **const sa_ptr =
         (const SocketAction **const)command.data;
       SocketAction sa = **sa_ptr;
       /* release the emulator thread - we've copied out everything
          we need */
       set_null_and_signal((const void **const)sa_ptr, sd);
+      SocketEntry **se = NULL;
       JLG(se, sd->sockets, sa.fd);
       if (NULL != se && LISTEN_SOCKET == (*se)->type) {
         Word_t index = -1;
         ErlDrvTermData **pid_ptr_found = NULL;
-        ErlDrvTermData **pid_ptr = NULL;
         /* find the last present index in the list of acceptors */
         JLL(pid_ptr_found, (*se)->socket.listen_socket.acceptors, index);
         if (NULL == pid_ptr_found)
           index = 0;
         else
           ++index;
-        JLI(pid_ptr, (*se)->socket.listen_socket.acceptors, index);
+
         ErlDrvTermData *pid =
           (ErlDrvTermData *)driver_alloc(sizeof(ErlDrvTermData));
         if (NULL == pid)
           driver_failure(sd->port, -1);
         *pid = sa.pid;  /* copy the calling pid into the memory just
                            allocated */
+
+        ErlDrvTermData **pid_ptr = NULL;
+        JLI(pid_ptr, (*se)->socket.listen_socket.acceptors, index);
         *pid_ptr = pid; /* make the array entry point at the memory
                            allocated */
+
         if (0 == index) /* if we're the first acceptor, enable the
                            watcher */
           ev_io_start(sd->epoller, (*se)->watcher);
@@ -724,13 +737,13 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
 
   case SPB_ASYNC_RECV:
     {
-      SocketEntry **se = NULL;
       const SocketAction **const sa_ptr =
         (const SocketAction **const)command.data;
       SocketAction sa = **sa_ptr;
       /* release the emulator thread - we've copied out everything we
          need */
       set_null_and_signal((const void **const)sa_ptr, sd);
+      SocketEntry **se = NULL;
       JLG(se, sd->sockets, sa.fd);
       if (NULL != se && CONNECTED_SOCKET == (*se)->type) {
         int64_t old_quota = (*se)->socket.connected_socket.quota;
@@ -935,7 +948,6 @@ static ErlDrvData spb_start(const ErlDrvPort port, char *const buff) {
 }
 
 static void spb_stop(const ErlDrvData drv_data) {
-  Word_t freed = 0;
   SpbData *const sd = (SpbData*)drv_data;
 
   command_set_and_notify(SPB_ASYNC_EXIT, NULL, sd);
@@ -948,20 +960,24 @@ static void spb_stop(const ErlDrvData drv_data) {
   driver_free((char*)sd->ok_fd_spec);
   driver_free((char*)sd->ok_fd_data_spec);
   driver_free((char*)sd->async_watcher);
+
   erl_drv_mutex_destroy(sd->mutex);
-  JLFA(freed, sd->sockets);
   erl_drv_cond_destroy(sd->cond);
+
+  Word_t freed = 0;
+  JLFA(freed, sd->sockets);
+
   driver_free((char*)drv_data);
 }
 
 static void spb_outputv(ErlDrvData drv_data, ErlIOVec *const ev) {
-  Reader reader;
-  ErlDrvTermData* spec = NULL;
-  const uint8_t* command = &spb_invalid_command;
   SpbData *const sd = (SpbData*)drv_data;
   sd->pid = driver_caller(sd->port);
-  /* dump_ev(ev); */
+  const uint8_t* command = &spb_invalid_command;
+  Reader reader;
   make_reader(ev, &reader);
+  ErlDrvTermData* spec = NULL;
+  /* dump_ev(ev); */
   if (read_uint8(&reader, &command)) {
     switch (*command) {
 
