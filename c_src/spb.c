@@ -846,6 +846,24 @@ static void *spb_ev_start(void *arg) {
  *****************************/
 
 static int spb_init() {
+  ErlDrvSysInfo info;
+  driver_system_info(&info, sizeof(ErlDrvSysInfo));
+
+  if (0 == info.thread_support) {
+    perror("spb cannot load: spb requires thread support\r\n");
+    return -1;
+  }
+
+  if (0 == info.smp_support) {
+    perror("spb cannot load: spb requires SMP support\r\n");
+    return -1;
+  }
+
+  if (0 == info.async_threads) {
+    perror("spb cannot load: spb requires async threads\r\n");
+    return -1;
+  }
+
   return 0;
 }
 
