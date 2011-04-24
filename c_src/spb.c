@@ -514,8 +514,8 @@ void async_socket_write(SocketAction *const sa) {
       /* huh, nothing to write after all. Oh well */
       erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
     } else {
-      /* printf("before:\r\n");
-         dump_ev(ev_ptr); */
+      /* printf("before:\r\n"); */
+      /* dump_ev(ev_ptr); */
 
       int iovcnt = ev_ptr->vsize > sd->iov_max ? sd->iov_max : ev_ptr->vsize;
       ssize_t ready = ev_ptr->size;
@@ -570,31 +570,27 @@ void async_socket_write(SocketAction *const sa) {
 
         int vremaining = ev_ptr->vsize - gone;
 
-        /* printf("ready: %d; gone: %d; offset: %d; vremaining: %d; remaining %d\r\n",
-                  ready, gone, written, vremaining, remaining); */
+        /* printf("ready: %d; gone: %d; offset: %d; vremaining: %d; remaining %d\r\n", */
+        /*           ready, gone, written, vremaining, remaining); */
 
         if (0 < gone) {
-          SysIOVec *iov2 = driver_alloc(vremaining * sizeof(SysIOVec));
-          if (NULL == iov2)
-            driver_failure(sd->port, -1);
-
-          ErlDrvBinary **binv2 =
-            driver_alloc(vremaining * sizeof(ErlDrvBinary *));
-          if (NULL == binv2)
-            driver_failure(sd->port, -1);
-
-          memcpy(iov2, &(ev_ptr->iov[gone]),
-                 vremaining * sizeof(SysIOVec));
-          memcpy(binv2, &(ev_ptr->binv[gone]),
-                 vremaining * sizeof(ErlDrvBinary *));
-
-          driver_free(ev_ptr->iov);
-          driver_free(ev_ptr->binv);
-
-          ev_ptr->iov   = iov2;
-          ev_ptr->binv  = binv2;
+          /* move the tail up to the front, then shrink */
+          memmove(ev_ptr->iov, &(ev_ptr->iov[gone]),
+                  vremaining * sizeof(SysIOVec));
+          memmove(ev_ptr->binv, &(ev_ptr->binv[gone]),
+                  vremaining * sizeof(ErlDrvBinary *));
           ev_ptr->size  = remaining;
           ev_ptr->vsize = vremaining;
+
+          ev_ptr->iov =
+            driver_realloc(ev_ptr->iov, vremaining * sizeof(SysIOVec));
+          if (NULL == ev_ptr->iov)
+            driver_failure(sd->port, -1);
+
+          ev_ptr->binv =
+            driver_realloc(ev_ptr->binv, vremaining * sizeof(ErlDrvBinary *));
+          if (NULL == ev_ptr->binv)
+            driver_failure(sd->port, -1);
         }
 
         /* finally, patch up the first element of iov2 wrt written,
@@ -603,8 +599,8 @@ void async_socket_write(SocketAction *const sa) {
         ev_ptr->iov[0].iov_len  -= written;
         ev_ptr->iov[0].iov_base += written;
 
-        /* printf("after:\r\n");
-           dump_ev(ev_ptr); */
+        /* printf("after:\r\n"); */
+        /* dump_ev(ev_ptr); */
 
         erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
         const void **sa_ptr_ptr = (const void **)&sa;
