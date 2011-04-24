@@ -25,7 +25,8 @@ enum _CommandType {
   SPB_LISTEN          = 0,
   SPB_CLOSE           = 1,
   SPB_ACCEPT          = 2,
-  SPB_RECV            = 3
+  SPB_RECV            = 3,
+  SPB_WRITE           = 4
 };
 typedef enum _CommandType CommandType;
 
@@ -37,12 +38,14 @@ enum _ReaderError {
 typedef enum _ReaderError ReaderError;
 
 enum _AsyncCommandType {
-  SPB_ASYNC_START     = 0,
-  SPB_ASYNC_EXIT      = 1,
-  SPB_ASYNC_LISTEN    = 2,
-  SPB_ASYNC_CLOSE     = 3,
-  SPB_ASYNC_ACCEPT    = 4,
-  SPB_ASYNC_RECV      = 5
+  SPB_ASYNC_START            = 0,
+  SPB_ASYNC_EXIT             = 1,
+  SPB_ASYNC_LISTEN           = 2,
+  SPB_ASYNC_CLOSE            = 3,
+  SPB_ASYNC_ACCEPT           = 4,
+  SPB_ASYNC_RECV             = 5,
+  SPB_ASYNC_WRITE            = 6,
+  SPB_ASYNC_INCOMPLETE_WRITE = 7
 };
 typedef enum _AsyncCommandType AsyncCommandType;
 

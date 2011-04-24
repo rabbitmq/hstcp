@@ -25,7 +25,7 @@
 #include <errno.h>
 #include <ev.h>
 #include <fcntl.h>
-#include <sys/ioctl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -56,6 +57,9 @@
 
 #define LISTEN_SOCKET 1
 #define CONNECTED_SOCKET 2
+
+#define WRITE_COMMAND_PREFIX_LENGTH 9
+#define DEFAULT_IOV_MAX 16
 
 typedef struct {
   uint8_t type;
@@ -93,10 +97,12 @@ typedef struct {
   struct ev_loop *epoller;           /* our ev loop                                    */
   ErlDrvTid      tid;                /* the thread running our ev loop                 */
   ev_async       *async_watcher;     /* the async watcher used to talk to our thread   */
-  ErlDrvMutex    *mutex;             /* mutex for safely communicating with our thread */
+  ErlDrvMutex    *command_mutex;     /* mutex for safely communicating with our thread */
   Command        command;            /* the command being sent to our thread           */
   Pvoid_t        sockets;            /* the Judy array to store state of FDs in        */
+  Pvoid_t        sockets_mutex;      /* mutex for safely accessing sockets             */
   ErlDrvCond     *cond;              /* conditional for signalling from thread to drv  */
+  int            iov_max;
 } SpbData;
 
 typedef struct {
@@ -112,6 +118,9 @@ typedef struct {
 
 typedef struct {
   int64_t quota;
+  ErlDrvMutex *mutex;
+  ErlIOVec *ev;
+  ev_io *watcher;
 } ConnectedSocket;
 
 typedef union {
@@ -130,6 +139,8 @@ typedef struct {
 typedef struct {
   int fd;
   int64_t value;
+  SpbData *sd;
+  ErlIOVec *ev;
 } SocketAction;
 
 uint8_t spb_invalid_command = SPB_INVALID_COMMAND;
@@ -156,7 +167,7 @@ void dump_ev(const ErlIOVec *const ev) {
              bin->orig_bytes, bin->orig_size);
     }
   }
-  printf("done\r\n");
+  printf("dump done\r\n");
 }
 
 void make_reader(ErlIOVec *const ev, Reader *const reader) {
@@ -260,17 +271,17 @@ void return_reader_error(SpbData *const sd, const Reader *const reader) {
  **************************/
 
 void await_non_null(const void *const *const ptr, SpbData *const sd) {
-  erl_drv_mutex_lock(sd->mutex);
+  erl_drv_mutex_lock(sd->command_mutex);
   while (NULL != ptr && NULL == *ptr)
-    erl_drv_cond_wait(sd->cond, sd->mutex);
-  erl_drv_mutex_unlock(sd->mutex);
+    erl_drv_cond_wait(sd->cond, sd->command_mutex);
+  erl_drv_mutex_unlock(sd->command_mutex);
 }
 
 void await_null(const void *const *const ptr, SpbData *const sd) {
-  erl_drv_mutex_lock(sd->mutex);
+  erl_drv_mutex_lock(sd->command_mutex);
   while (NULL != ptr && NULL != *ptr)
-    erl_drv_cond_wait(sd->cond, sd->mutex);
-  erl_drv_mutex_unlock(sd->mutex);
+    erl_drv_cond_wait(sd->cond, sd->command_mutex);
+  erl_drv_mutex_unlock(sd->command_mutex);
 }
 
 void await_epoller(SpbData *const sd) {
@@ -278,10 +289,10 @@ void await_epoller(SpbData *const sd) {
 }
 
 void set_null_and_signal(const void **const ptr, SpbData *const sd) {
-  erl_drv_mutex_lock(sd->mutex);
+  erl_drv_mutex_lock(sd->command_mutex);
   *ptr = NULL;
   erl_drv_cond_signal(sd->cond);
-  erl_drv_mutex_unlock(sd->mutex);
+  erl_drv_mutex_unlock(sd->command_mutex);
 }
 
 
@@ -291,17 +302,17 @@ void set_null_and_signal(const void **const ptr, SpbData *const sd) {
 
 void command_set_and_notify(const uint8_t type, const void *const data,
                             SpbData *const sd) {
-  erl_drv_mutex_lock(sd->mutex);
+  erl_drv_mutex_lock(sd->command_mutex);
   sd->command.type = type;
   sd->command.data = data;
-  erl_drv_mutex_unlock(sd->mutex);
+  erl_drv_mutex_unlock(sd->command_mutex);
   ev_async_send(sd->epoller, sd->async_watcher);
 }
 
 void command_get(Command *cmd, SpbData *const sd) {
-  erl_drv_mutex_lock(sd->mutex);
+  erl_drv_mutex_lock(sd->command_mutex);
   *cmd = sd->command; /* copy out the command from sd */
-  erl_drv_mutex_unlock(sd->mutex);
+  erl_drv_mutex_unlock(sd->command_mutex);
 }
 
 
@@ -486,11 +497,152 @@ void socket_recv(SpbData *const sd, Reader *const reader) {
   await_null(sa_ptr_ptr, sd);
 }
 
+void socket_entry_destroy(SocketEntry *, SpbData *const);
+
+void async_socket_write(SocketAction *const sa) {
+  const int fd = sa->fd;
+  SpbData *const sd = sa->sd;
+  SocketEntry **se_ptr = NULL;
+  SocketEntry *se = NULL;
+
+  erl_drv_mutex_lock(sd->sockets_mutex);
+  JLG(se_ptr, sd->sockets, fd); /* find the SocketEntry for fd */
+
+  if (NULL != se_ptr && NULL != *se_ptr &&
+      CONNECTED_SOCKET == (*se_ptr)->type) {
+    se = *se_ptr;
+    erl_drv_mutex_lock(se->socket.connected_socket.mutex);
+    erl_drv_mutex_unlock(sd->sockets_mutex);
+    ErlIOVec *ev_ptr = se->socket.connected_socket.ev;
+    if (0 == ev_ptr->size) {
+      /* huh, nothing to write after all. Oh well */
+      erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
+    } else {
+      /* printf("before:\r\n");
+         dump_ev(ev_ptr); */
+
+      int iovcnt = ev_ptr->vsize > sd->iov_max ? sd->iov_max : ev_ptr->vsize;
+      ssize_t ready = ev_ptr->size;
+      ssize_t written = writev(fd, (const struct iovec *)ev_ptr->iov, iovcnt);
+
+      if (0 > written) {
+        return_socket_error(sd, fd, errno);
+        erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
+
+        erl_drv_mutex_lock(sd->sockets_mutex);
+        socket_entry_destroy(se, sd);
+        int rc = 0; /* don't care about the result of the judy delete */
+        JLD(rc, sd->sockets, fd);
+        erl_drv_mutex_unlock(sd->sockets_mutex);
+        close(fd);
+
+      } else if (written == ready) {
+        for (int idx = 0; idx < ev_ptr->vsize; ++idx) {
+          driver_free_binary(ev_ptr->binv[idx]);
+        }
+        driver_free(ev_ptr->iov);
+        driver_free(ev_ptr->binv);
+        ev_ptr->iov = NULL;
+        ev_ptr->binv = NULL;
+        ev_ptr->size = 0;
+        ev_ptr->vsize = 0;
+        erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
+
+      } else if (0 == written) {
+        erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
+
+        const void **sa_ptr_ptr = (const void **)&sa;
+        command_set_and_notify(SPB_ASYNC_INCOMPLETE_WRITE, sa_ptr_ptr, sd);
+        await_null(sa_ptr_ptr, sd);
+
+      } else {
+        int remaining = ev_ptr->size - written;
+        int gone = 0;
+        ssize_t written2 = 0;
+        for (int idx = 0; idx < ev_ptr->vsize; ++idx) {
+          written2 = written - ev_ptr->iov[idx].iov_len;
+          if (0 > written2) {
+            /* the write stopped half way through an element */
+            break;
+          } else {
+            written = written2;
+            driver_free_binary(ev_ptr->binv[idx]);
+            ++gone;
+            if (0 == written)
+              break;
+          }
+        }
+
+        int vremaining = ev_ptr->vsize - gone;
+
+        /* printf("ready: %d; gone: %d; offset: %d; vremaining: %d; remaining %d\r\n",
+                  ready, gone, written, vremaining, remaining); */
+
+        if (0 < gone) {
+          SysIOVec *iov2 = driver_alloc(vremaining * sizeof(SysIOVec));
+          if (NULL == iov2)
+            driver_failure(sd->port, -1);
+
+          ErlDrvBinary **binv2 =
+            driver_alloc(vremaining * sizeof(ErlDrvBinary *));
+          if (NULL == binv2)
+            driver_failure(sd->port, -1);
+
+          memcpy(iov2, &(ev_ptr->iov[gone]),
+                 vremaining * sizeof(SysIOVec));
+          memcpy(binv2, &(ev_ptr->binv[gone]),
+                 vremaining * sizeof(ErlDrvBinary *));
+
+          driver_free(ev_ptr->iov);
+          driver_free(ev_ptr->binv);
+
+          ev_ptr->iov   = iov2;
+          ev_ptr->binv  = binv2;
+          ev_ptr->size  = remaining;
+          ev_ptr->vsize = vremaining;
+        }
+
+        /* finally, patch up the first element of iov2 wrt written,
+           which now holds the offset into the iov that we stopped
+           in */
+        ev_ptr->iov[0].iov_len  -= written;
+        ev_ptr->iov[0].iov_base += written;
+
+        /* printf("after:\r\n");
+           dump_ev(ev_ptr); */
+
+        erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
+        const void **sa_ptr_ptr = (const void **)&sa;
+        command_set_and_notify(SPB_ASYNC_INCOMPLETE_WRITE, sa_ptr_ptr, sd);
+        await_null(sa_ptr_ptr, sd);
+      }
+    }
+  } else {
+    erl_drv_mutex_unlock(sd->sockets_mutex);
+  }
+}
+
+void socket_write(SpbData *const sd, Reader *const reader) {
+  const int64_t *fd64_ptr = NULL;
+  if (! read_int64(reader, &fd64_ptr)) {
+    /* write is async so just drop this silently! */
+    return;
+  }
+  SocketAction sa;
+  sa.fd = (int)*fd64_ptr;
+  sa.ev = reader->ev;
+  const SocketAction *sa_ptr = &sa;
+  const void **sa_ptr_ptr = (const void **)&sa_ptr;
+  command_set_and_notify(SPB_ASYNC_WRITE, sa_ptr_ptr, sd);
+  await_null(sa_ptr_ptr, sd);
+}
+
 
 /***********************
  *  ev_loop callbacks  *
  ***********************/
 
+static void spb_ev_socket_write_cb(EV_P_ ev_io *, int);
 static void spb_ev_socket_read_cb(EV_P_ ev_io *, int);
 static void spb_ev_listen_cb(EV_P_ ev_io *, int);
 
@@ -525,7 +677,28 @@ SocketEntry *connected_socket_create(const int fd, ErlDrvTermData pid,
   se->fd = fd;
   se->pid = pid;
   se->socket.connected_socket.quota = 0;
+  se->socket.connected_socket.ev =
+    (ErlIOVec *)driver_alloc(sizeof(ErlIOVec));
+  if (NULL == se->socket.connected_socket.ev)
+    driver_failure(sd->port, -1);
+  se->socket.connected_socket.ev->vsize = 0;
+  se->socket.connected_socket.ev->size = 0;
+  se->socket.connected_socket.ev->iov = NULL;
+  se->socket.connected_socket.ev->binv = NULL;
+  se->socket.connected_socket.mutex = erl_drv_mutex_create("spb socket mutex");
+  if (NULL == se->socket.connected_socket.mutex)
+    driver_failure(sd->port, -1);
 
+  /* create the write watcher */
+  se->socket.connected_socket.watcher = (ev_io*)driver_alloc(sizeof(ev_io));
+  if (NULL == se->socket.connected_socket.watcher)
+    driver_failure(sd->port, -1);
+
+  ev_io_init(se->socket.connected_socket.watcher, spb_ev_socket_write_cb, fd,
+             EV_WRITE);
+  se->socket.connected_socket.watcher->data = sd;
+
+  /* create the read watcher */
   se->watcher = (ev_io*)driver_alloc(sizeof(ev_io));
   if (NULL == se->watcher)
     driver_failure(sd->port, -1);
@@ -534,6 +707,12 @@ SocketEntry *connected_socket_create(const int fd, ErlDrvTermData pid,
   se->watcher->data = sd;
 
   return se;
+}
+
+void free_binaries(const ErlIOVec *const ev) {
+  for (int idx = 1; idx < ev->vsize; ++idx) {
+    driver_free_binary(ev->binv[idx]);
+  }
 }
 
 void socket_entry_destroy(SocketEntry *se, SpbData *const sd) {
@@ -549,6 +728,17 @@ void socket_entry_destroy(SocketEntry *se, SpbData *const sd) {
     break;
 
   case CONNECTED_SOCKET:
+    /* TODO - maybe warn if the write queue's not empty? */
+    ev_io_stop(sd->epoller, se->socket.connected_socket.watcher);
+    driver_free(se->socket.connected_socket.watcher);
+
+    erl_drv_mutex_lock(se->socket.connected_socket.mutex);
+    free_binaries(se->socket.connected_socket.ev);
+    driver_free(se->socket.connected_socket.ev->iov);
+    driver_free(se->socket.connected_socket.ev->binv);
+    driver_free(se->socket.connected_socket.ev);
+    erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
+    erl_drv_mutex_destroy(se->socket.connected_socket.mutex);
     break;
 
   }
@@ -556,15 +746,57 @@ void socket_entry_destroy(SocketEntry *se, SpbData *const sd) {
   driver_free(se);
 }
 
+static void spb_ev_socket_write_cb(EV_P_ ev_io *w, int revents) {
+  ev_io_stop(EV_A_ w); /* stop the watcher immediately */
+  SpbData *const sd = (SpbData *const)(w->data);
+  const int fd = w->fd;
+  SocketEntry **se_ptr = NULL;
+  SocketEntry *se = NULL;
+
+  erl_drv_mutex_lock(sd->sockets_mutex);
+  JLG(se_ptr, sd->sockets, fd); /* find the SocketEntry for fd */
+
+  if (NULL != se_ptr && NULL != *se_ptr &&
+      CONNECTED_SOCKET == (*se_ptr)->type) {
+    se = *se_ptr;
+    ErlIOVec *ev_ptr = NULL;
+    erl_drv_mutex_lock(se->socket.connected_socket.mutex);
+    erl_drv_mutex_unlock(sd->sockets_mutex);
+    /* do we really have work to do? */
+    ev_ptr = se->socket.connected_socket.ev;
+    if (NULL != ev_ptr && ev_ptr->size > 0) {
+      /* definitely have data to write, so call driver_async */
+      erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
+      SocketAction *sa =
+        (SocketAction *)driver_alloc(sizeof(SocketAction));
+      if (NULL == sa)
+        driver_failure(sd->port, -1);
+      sa->fd = fd;
+      sa->sd = sd;
+      /* the driver_free on the end will ensure the above SocketAction
+         is free'd after the async_socket_write is done */
+      driver_async(sd->port, (unsigned int *)&(sa->fd),
+                   (void (*)(void *))async_socket_write, sa, driver_free);
+    } else {
+      erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
+    }
+  }
+}
+
 static void spb_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
   SpbData *const sd = (SpbData *const)(w->data);
   const int fd = w->fd;
-  SocketEntry **se = NULL;
+  SocketEntry **se_ptr = NULL;
+  SocketEntry *se = NULL;
 
-  JLG(se, sd->sockets, w->fd); /* find the SocketEntry for fd */
+  erl_drv_mutex_lock(sd->sockets_mutex);
+  JLG(se_ptr, sd->sockets, fd); /* find the SocketEntry for fd */
 
-  if (NULL != se && NULL != *se && CONNECTED_SOCKET == (*se)->type) {
-    ErlDrvTermData pid = (*se)->pid;
+  if (NULL != se_ptr && NULL != *se_ptr &&
+      CONNECTED_SOCKET == (*se_ptr)->type) {
+    se = *se_ptr;
+    erl_drv_mutex_unlock(sd->sockets_mutex);
+    ErlDrvTermData pid = se->pid;
     int bytes_ready = -1;
 
     if (ioctl(fd, FIONREAD, &bytes_ready) < 0) {
@@ -574,16 +806,19 @@ static void spb_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
 
     if (0 == bytes_ready) {
       ev_io_stop(EV_A_ w);
+      erl_drv_mutex_lock(sd->sockets_mutex);
+      socket_entry_destroy(se, sd);
+      int rc; /* don't care about the result of the judy delete */
+      JLD(rc, sd->sockets, fd);
+      erl_drv_mutex_unlock(sd->sockets_mutex);
+
       if (0 > close(fd))
         return_socket_error_pid(sd, fd, errno, pid);
       else
         return_socket_closed_pid(sd, fd, pid);
-      socket_entry_destroy(*se, sd);
-      int rc; /* don't care about the result of the judy delete */
-      JLD(rc, sd->sockets, fd);
 
     } else {
-      int quota = (*se)->socket.connected_socket.quota;
+      int quota = se->socket.connected_socket.quota;
       int requested = (0 <= quota && quota < bytes_ready) ? quota : bytes_ready;
       ssize_t achieved = 0;
 
@@ -616,15 +851,16 @@ static void spb_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
       if (0 < quota) {
         if (achieved == quota)
           ev_io_stop(EV_A_ w);
-        (*se)->socket.connected_socket.quota -= achieved;
+        se->socket.connected_socket.quota -= achieved;
       } else if (-1 == quota) {
         ev_io_stop(EV_A_ w);
-        (*se)->socket.connected_socket.quota = 0;
+        se->socket.connected_socket.quota = 0;
       }
     }
   } else {
     /* we've just received data for a socket we have no idea
        about. This is a fatal error */
+    erl_drv_mutex_unlock(sd->sockets_mutex);
     perror("received data for unknown socket\r\n");
     driver_failure(sd->port, -1);
   }
@@ -633,23 +869,27 @@ static void spb_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
 static void spb_ev_listen_cb(EV_P_ ev_io *w, int revents) {
   SpbData *const sd = (SpbData *const)(w->data);
   const int fd = w->fd;
-  SocketEntry **se = NULL;
+  SocketEntry **se_ptr = NULL;
+  SocketEntry *se = NULL;
 
-  JLG(se, sd->sockets, fd); /* find the SocketEntry for fd */
+  erl_drv_mutex_lock(sd->sockets_mutex);
+  JLG(se_ptr, sd->sockets, fd); /* find the SocketEntry for fd */
 
-  if (NULL != se && NULL != *se && LISTEN_SOCKET == (*se)->type) {
+  if (NULL != se_ptr && NULL != *se_ptr && LISTEN_SOCKET == (*se_ptr)->type) {
+    se = *se_ptr;
+    erl_drv_mutex_unlock(sd->sockets_mutex);
     ErlDrvTermData *const *pid_ptr = NULL;
     Word_t index = 0;
 
-    /* find first entry in acceptors */
-    JLBC(pid_ptr, (*se)->socket.listen_socket.acceptors, 1, index);
+    /* find the first entry in acceptors */
+    JLF(pid_ptr, se->socket.listen_socket.acceptors, index);
 
     if (NULL != pid_ptr && NULL != *pid_ptr) {
       const ErlDrvTermData pid = **pid_ptr; /* copy out pid */
       driver_free(*pid_ptr); /* was allocated in SPB_ASYNC_ACCEPT */
 
       int rc = 0; /* delete that entry from acceptors */
-      JLD(rc, (*se)->socket.listen_socket.acceptors, index);
+      JLD(rc, se->socket.listen_socket.acceptors, index);
 
       struct sockaddr_in client_addr;
       socklen_t client_len;
@@ -670,19 +910,22 @@ static void spb_ev_listen_cb(EV_P_ ev_io *w, int revents) {
 
       /* figure out if there are more pending acceptors */
       pid_ptr = NULL;
-      JLBC(pid_ptr, (*se)->socket.listen_socket.acceptors, 1, index);
+      JLF(pid_ptr, se->socket.listen_socket.acceptors, index);
       if (NULL == pid_ptr)
         ev_io_stop(EV_A_ w);
 
-      se = NULL;
-      JLI(se, sd->sockets, accepted_fd);
-      *se = connected_socket_create(accepted_fd, pid, sd);
+      erl_drv_mutex_lock(sd->sockets_mutex);
+      se_ptr = NULL;
+      JLI(se_ptr, sd->sockets, accepted_fd);
+      *se_ptr = connected_socket_create(accepted_fd, pid, sd);
+      erl_drv_mutex_unlock(sd->sockets_mutex);
 
     } else {
       perror("Accepted a connection, but no acceptor ready\r\n");
       driver_failure(sd->port, -1);
     }
   } else {
+    erl_drv_mutex_unlock(sd->sockets_mutex);
     perror("Cannot find entry for listening socket\r\n");
     driver_failure(sd->port, -1);
   }
@@ -712,9 +955,11 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
       const int **const fd_ptr = (const int **const)command.data;
       const int fd = **fd_ptr;
       set_null_and_signal((const void **const)fd_ptr, sd);
-      SocketEntry **se = NULL;
-      JLI(se, sd->sockets, fd);
-      *se = listen_socket_create(fd, caller, sd);
+      erl_drv_mutex_lock(sd->sockets_mutex);
+      SocketEntry **se_ptr = NULL;
+      JLI(se_ptr, sd->sockets, fd);
+      *se_ptr = listen_socket_create(fd, caller, sd);
+      erl_drv_mutex_unlock(sd->sockets_mutex);
 
       return_ok_fd_pid(sd, caller, fd);
       break;
@@ -726,17 +971,23 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
          sockets */
       const int **const fd_ptr = (const int **const)command.data;
       const int fd = **fd_ptr;
-      SocketEntry **se = NULL;
-      JLG(se, sd->sockets, fd);
-      if (NULL != se && NULL != *se && caller == (*se)->pid) {
+      erl_drv_mutex_lock(sd->sockets_mutex);
+      SocketEntry **se_ptr = NULL;
+      JLG(se_ptr, sd->sockets, fd);
+      if (NULL != se_ptr && NULL != *se_ptr && caller == (*se_ptr)->pid) {
+        /* destroy first to ensure no async writer is working on the
+           fd when we do the */
+        socket_entry_destroy(*se_ptr, sd);
+        int rc = 0; /* don't care about the result of the judy delete */
+        JLD(rc, sd->sockets, fd);
+        erl_drv_mutex_unlock(sd->sockets_mutex);
         if (0 > close(fd))
           return_socket_error(sd, fd, errno);
         else
           return_socket_closed_pid(sd, fd, caller);
-        socket_entry_destroy(*se, sd);
-        int rc = 0; /* don't care about the result of the judy delete */
-        JLD(rc, sd->sockets, fd);
+
       } else {
+        erl_drv_mutex_unlock(sd->sockets_mutex);
         return_socket_bad_pid(sd, fd, caller); /* programmer messed up */
       }
       /* Only now release the emulator thread */
@@ -751,13 +1002,18 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
       /* release the emulator thread - we've copied out everything
          we need */
       set_null_and_signal((const void **const)fd_ptr, sd);
-      SocketEntry **se = NULL;
-      JLG(se, sd->sockets, fd);
-      if (NULL != se && NULL != *se && LISTEN_SOCKET == (*se)->type) {
+      erl_drv_mutex_lock(sd->sockets_mutex);
+      SocketEntry **se_ptr = NULL;
+      SocketEntry *se = NULL;
+      JLG(se_ptr, sd->sockets, fd);
+      if (NULL != se_ptr && NULL != *se_ptr &&
+          LISTEN_SOCKET == (*se_ptr)->type) {
+        se = *se_ptr;
+        erl_drv_mutex_unlock(sd->sockets_mutex);
         Word_t index = -1;
         ErlDrvTermData **pid_ptr_found = NULL;
         /* find the last present index in the list of acceptors */
-        JLL(pid_ptr_found, (*se)->socket.listen_socket.acceptors, index);
+        JLL(pid_ptr_found, se->socket.listen_socket.acceptors, index);
         if (NULL == pid_ptr_found)
           index = 0;
         else
@@ -771,15 +1027,16 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
                            allocated */
 
         ErlDrvTermData **pid_ptr = NULL;
-        JLI(pid_ptr, (*se)->socket.listen_socket.acceptors, index);
+        JLI(pid_ptr, se->socket.listen_socket.acceptors, index);
         *pid_ptr = pid; /* make the array entry point at the memory
                            allocated */
 
         if (0 == index) /* if we're the first acceptor, enable the
                            watcher */
-          ev_io_start(sd->epoller, (*se)->watcher);
+          ev_io_start(sd->epoller, se->watcher);
         return_ok_fd_pid(sd, caller, fd);
       } else {
+        erl_drv_mutex_unlock(sd->sockets_mutex);
         return_socket_bad_pid(sd, fd, caller); /* programmer messed up */
       }
       break;
@@ -793,20 +1050,120 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
       /* release the emulator thread - we've copied out everything we
          need */
       set_null_and_signal((const void **const)sa_ptr, sd);
-      SocketEntry **se = NULL;
-      JLG(se, sd->sockets, sa.fd);
-      if (NULL != se && NULL != *se && CONNECTED_SOCKET == (*se)->type &&
-          caller == (*se)->pid) {
-        int64_t old_quota = (*se)->socket.connected_socket.quota;
-        (*se)->socket.connected_socket.quota = sa.value;
+      erl_drv_mutex_lock(sd->sockets_mutex);
+      SocketEntry **se_ptr = NULL;
+      SocketEntry *se = NULL;
+      JLG(se_ptr, sd->sockets, sa.fd);
+      if (NULL != se_ptr && NULL != *se_ptr &&
+          CONNECTED_SOCKET == (*se_ptr)->type && caller == (*se_ptr)->pid) {
+        se = *se_ptr;
+        erl_drv_mutex_unlock(sd->sockets_mutex);
+        int64_t old_quota = se->socket.connected_socket.quota;
+        se->socket.connected_socket.quota = sa.value;
         if (0 == sa.value && 0 != old_quota)
-          ev_io_stop(sd->epoller, (*se)->watcher);
+          ev_io_stop(sd->epoller, se->watcher);
         else if (0 != sa.value && 0 == old_quota)
-          ev_io_start(sd->epoller, (*se)->watcher);
+          ev_io_start(sd->epoller, se->watcher);
       } else {
+        erl_drv_mutex_unlock(sd->sockets_mutex);
         return_socket_bad_pid(sd, sa.fd, caller); /* programmer messed up */
       }
       break;
+    }
+
+  case SPB_ASYNC_WRITE:
+    {
+      const SocketAction **const sa_ptr =
+        (const SocketAction **const)command.data;
+      SocketAction sa = **sa_ptr;
+
+      /* need to copy out and extend the writer's ev before we can
+         release the driver */
+
+      erl_drv_mutex_lock(sd->sockets_mutex);
+      SocketEntry **se_ptr = NULL;
+      SocketEntry *se = NULL;
+      JLG(se_ptr, sd->sockets, sa.fd);
+      if (NULL != se_ptr && NULL != *se_ptr &&
+          CONNECTED_SOCKET == (*se_ptr)->type) {
+        se = *se_ptr;
+        erl_drv_mutex_lock(se->socket.connected_socket.mutex);
+        erl_drv_mutex_unlock(sd->sockets_mutex);
+        ErlIOVec *ev_ptr = se->socket.connected_socket.ev;
+
+        int new_offset = 1;
+        if (sa.ev->iov[1].iov_len == WRITE_COMMAND_PREFIX_LENGTH) {
+          /* row 1 is prefix only. Skip it */
+          new_offset = 2;
+        } else {
+          /* adjust row 1 to skip prefix */
+          sa.ev->iov[1].iov_len -= WRITE_COMMAND_PREFIX_LENGTH;
+          sa.ev->iov[1].iov_base += WRITE_COMMAND_PREFIX_LENGTH;
+        }
+        int length = sa.ev->vsize - new_offset;
+        int total_length = length + ev_ptr->vsize;
+
+        ev_ptr->iov = driver_realloc(ev_ptr->iov,
+                                     total_length * sizeof(SysIOVec));
+        if (NULL == ev_ptr->iov)
+          driver_failure(sd->port, -1);
+
+        ev_ptr->binv = driver_realloc(ev_ptr->binv,
+                                      total_length * sizeof(ErlDrvBinary *));
+        if (NULL == ev_ptr->binv)
+          driver_failure(sd->port, -1);
+
+        int old_offset = ev_ptr->vsize;
+        for (int idx = 0; idx + new_offset < sa.ev->vsize; ++idx) {
+          driver_binary_inc_refc(sa.ev->binv[new_offset + idx]);
+          ev_ptr->iov[old_offset + idx] = sa.ev->iov[new_offset + idx];
+          ev_ptr->binv[old_offset + idx] = sa.ev->binv[new_offset + idx];
+          /* we use size to mean writable size */
+          ev_ptr->size += sa.ev->iov[new_offset + idx].iov_len;
+        }
+        ev_ptr->vsize = total_length;
+
+        /* release the emulator thread - we've copied out everything
+           we need */
+        set_null_and_signal((const void **const)sa_ptr, sd);
+        erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
+
+        if (0 == old_offset) {
+          SocketAction *sa1 =
+            (SocketAction *)driver_alloc(sizeof(SocketAction));
+          if (NULL == sa1)
+            driver_failure(sd->port, -1);
+          *sa1 = sa;
+          sa1->sd = sd;
+          /* the driver_free on the end will ensure the above
+             SocketAction is free'd after the async_socket_write is
+             done */
+          driver_async(sd->port, (unsigned int *)&(sa1->fd),
+                       (void (*)(void *))async_socket_write, sa1, driver_free);
+        }
+      } else {
+        erl_drv_mutex_unlock(sd->sockets_mutex);
+        set_null_and_signal((const void **const)sa_ptr, sd);
+      }
+      break;
+    }
+
+  case SPB_ASYNC_INCOMPLETE_WRITE:
+    {
+      const SocketAction **const sa_ptr =
+        (const SocketAction **const)command.data;
+      SocketAction sa = **sa_ptr;
+
+      /* release the driver async thread - we've copied out everything
+         we need */
+      set_null_and_signal((const void **const)sa_ptr, sd);
+      erl_drv_mutex_lock(sd->sockets_mutex);
+      SocketEntry **se_ptr = NULL;
+      JLG(se_ptr, sd->sockets, sa.fd);
+      if (NULL != se_ptr && NULL != *se_ptr &&
+          CONNECTED_SOCKET == (*se_ptr)->type)
+        ev_io_start(sd->epoller, (*se_ptr)->socket.connected_socket.watcher);
+      erl_drv_mutex_unlock(sd->sockets_mutex);
     }
   }
 }
@@ -819,7 +1176,7 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
 static void *spb_ev_start(void *arg) {
   SpbData *const sd = (SpbData*)arg;
 
-  erl_drv_mutex_lock(sd->mutex);
+  erl_drv_mutex_lock(sd->command_mutex);
 
   sd->epoller = ev_loop_new(0);
   if (NULL == sd->epoller)
@@ -834,7 +1191,7 @@ static void *spb_ev_start(void *arg) {
   ev_async_start(sd->epoller, sd->async_watcher);
 
   erl_drv_cond_signal(sd->cond);
-  erl_drv_mutex_unlock(sd->mutex);
+  erl_drv_mutex_unlock(sd->command_mutex);
 
   ev_loop(sd->epoller, 0);
   return NULL;
@@ -1042,12 +1399,26 @@ static ErlDrvData spb_start(const ErlDrvPort port, char *const buff) {
      that point, everything truly is up and running.
   */
   sd->epoller = NULL;
-  sd->mutex = erl_drv_mutex_create("spb");
-  if (NULL == sd->mutex)
+  sd->command_mutex = erl_drv_mutex_create("spb command mutex");
+  if (NULL == sd->command_mutex)
+    return ERL_DRV_ERROR_GENERAL;
+
+  sd->cond = erl_drv_cond_create("spb command condition");
+  if (NULL == sd->cond)
     return ERL_DRV_ERROR_GENERAL;
 
   sd->sockets = (Pvoid_t)NULL;
-  sd->cond = erl_drv_cond_create("spb");
+  sd->sockets_mutex = erl_drv_mutex_create("spb sockets mutex");
+  if (NULL == sd->command_mutex)
+    return ERL_DRV_ERROR_GENERAL;
+
+  sd->iov_max = 0;
+#if defined(_SC_IOV_MAX) /* IRIX, MacOS X, FreeBSD, Solaris, QNX, ... */
+  sd->iov_max = sysconf(_SC_IOV_MAX);
+#elif defined(IOV_MAX)
+  sd->iov_max = IOV_MAX;
+#endif
+  sd->iov_max = sd->iov_max <= 0 ? DEFAULT_IOV_MAX : sd->iov_max;
 
   if (0 != erl_drv_thread_create("spb", &(sd->tid), &spb_ev_start, sd, NULL))
     return ERL_DRV_ERROR_GENERAL;
@@ -1074,9 +1445,10 @@ static void spb_stop(const ErlDrvData drv_data) {
   driver_free((char*)sd->fd_bad_spec);
   driver_free((char*)sd->async_watcher);
 
-  erl_drv_mutex_destroy(sd->mutex);
+  erl_drv_mutex_destroy(sd->command_mutex);
   erl_drv_cond_destroy(sd->cond);
 
+  erl_drv_mutex_destroy(sd->sockets_mutex);
   Word_t freed = 0;
   JLFA(freed, sd->sockets);
 
@@ -1108,6 +1480,10 @@ static void spb_outputv(ErlDrvData drv_data, ErlIOVec *const ev) {
 
     case SPB_RECV:
       socket_recv(sd, &reader);
+      break;
+
+    case SPB_WRITE:
+      socket_write(sd, &reader);
       break;
 
     default:

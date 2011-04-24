@@ -16,8 +16,9 @@
 
 -module(spb_drv).
 
--export([start/0, stop/1, listen/3, close/2, accept/2, recv/3]).
--export([spawn_test/1, test/1]).
+-export([start/0, stop/1, listen/3, close/2, accept/2, recv/3, write/3]).
+
+-export([spawn_test/1, test/1, test_write/1]).
 
 -define(LIBNAME, "libspb").
 
@@ -25,6 +26,47 @@
 -define(SPB_CLOSE,  1).
 -define(SPB_ACCEPT, 2).
 -define(SPB_RECV,   3).
+-define(SPB_WRITE,  4).
+
+test_write(IpPort) ->
+    {ok, Port} = spb_drv:start(),
+    {ok, Fd} = spb_drv:listen("0.0.0.0", IpPort, Port),
+    BigBin1 = <<-1:4096/native-unsigned>>,
+    BigBin2 = <<1:4096/native-unsigned>>,
+    SmallBin = <<10:8/native-unsigned>>,
+    {ok, Fd} = spb_drv:accept(Fd, Port),
+    receive
+        {spb_event, Port, {ok, Fd1}} ->
+            io:format("small bin raw~n"),
+            spb_drv:write(Fd1, Port, SmallBin),
+            io:format("small bin list~n"),
+            spb_drv:write(Fd1, Port, [SmallBin]),
+            io:format("big bin raw~n"),
+            spb_drv:write(Fd1, Port, BigBin1),
+            io:format("big bin list~n"),
+            spb_drv:write(Fd1, Port, [BigBin1]),
+            io:format("small big~n"),
+            spb_drv:write(Fd1, Port, [SmallBin, BigBin1]),
+            io:format("big small~n"),
+            spb_drv:write(Fd1, Port, [BigBin1, SmallBin]),
+            io:format("small big1 big2~n"),
+            spb_drv:write(Fd1, Port, [SmallBin, BigBin1, BigBin2]),
+            io:format("big1 small big2~n"),
+            spb_drv:write(Fd1, Port, [BigBin1, SmallBin, BigBin2]),
+            io:format("big1 big2 small~n"),
+            spb_drv:write(Fd1, Port, [BigBin1, BigBin2, SmallBin]),
+            io:format("small small~n"),
+            spb_drv:write(Fd1, Port, [SmallBin, SmallBin]),
+            io:format("big big~n"),
+            spb_drv:write(Fd1, Port, [BigBin1, BigBin1]),
+            io:format("massive~n"),
+            spb_drv:write(Fd1, Port, [lists:duplicate(2000, BigBin1), BigBin2]),
+            io:format("done~n"),
+            timer:sleep(5000),
+            {closed, Fd1} = spb_drv:close(Fd1, Port),
+            {closed, Fd} = spb_drv:close(Fd, Port),
+            ok = spb_drv:stop(Port)
+    end.
 
 spawn_test(IpPort) ->
     spawn(fun () -> test(IpPort) end).
@@ -35,7 +77,7 @@ test(IpPort) ->
     {ok, Fd} = spb_drv:accept(Fd, Port),
     receive
         {spb_event, Port, {ok, Fd1}} ->
-            ok = spb_drv:recv(all, Fd1, Port),
+            ok = spb_drv:recv(once, Fd1, Port),
             Result = drain(Fd1, Port, now(), 0, 0),
             {closed, Fd} = spb_drv:close(Fd, Port),
             ok = spb_drv:stop(Port),
@@ -44,7 +86,7 @@ test(IpPort) ->
 drain(Fd, Port, Start, Count, Size) ->
     receive
         {spb_event, Port, {data, Fd, Data}} ->
-            %%ok = spb_drv:recv(once, Fd, Port),
+            ok = spb_drv:recv(once, Fd, Port),
             drain(Fd, Port, Start, Count+1, Size + size(Data));
         {spb_event, Port, Event} ->
             Elapsed = timer:now_diff(now(), Start),
@@ -95,6 +137,11 @@ recv(Bytes, Fd, Port) ->
 recv1(N, Fd, Port) ->
     true = port_command(
              Port, <<?SPB_RECV, Fd:64/native-signed, N:64/native-signed>>),
+    ok.
+
+write(Fd, Port, Data) ->
+    true = port_command(
+             Port, [<<?SPB_WRITE, Fd:64/native-signed>>, Data]),
     ok.
 
 %% ---------------------------------------------------------------------------
