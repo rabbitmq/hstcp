@@ -45,7 +45,8 @@ enum _AsyncCommandType {
   SPB_ASYNC_ACCEPT           = 4,
   SPB_ASYNC_RECV             = 5,
   SPB_ASYNC_WRITE            = 6,
-  SPB_ASYNC_INCOMPLETE_WRITE = 7
+  SPB_ASYNC_INCOMPLETE_WRITE = 7,
+  SPB_ASYNC_DESTROY_SOCKET   = 8
 };
 typedef enum _AsyncCommandType AsyncCommandType;
 
