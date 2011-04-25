@@ -18,7 +18,7 @@
 
 -export([start/0, stop/1, listen/3, close/2, accept/2, recv/3, write/3]).
 
--export([spawn_test/1, test/1, test_write/1]).
+-export([spawn_test/1, test/1, test_write/1, test_write2/1, test_write3/1]).
 
 -define(LIBNAME, "libspb").
 
@@ -67,6 +67,45 @@ test_write(IpPort) ->
             {closed, Fd} = spb_drv:close(Fd, Port),
             ok = spb_drv:stop(Port)
     end.
+
+test_write2(IpPort) ->
+    {ok, Port} = spb_drv:start(),
+    {ok, Fd} = spb_drv:listen("0.0.0.0", IpPort, Port),
+    Bin = <<-1:524288/native-unsigned>>,
+    Lst = lists:duplicate(16384, Bin),
+    {ok, Fd} = spb_drv:accept(Fd, Port),
+    receive
+        {spb_event, Port, {ok, Fd1}} ->
+            spb_drv:write(Fd1, Port, Lst),
+            timer:sleep(10000),
+            {closed, Fd1} = spb_drv:close(Fd1, Port),
+            {closed, Fd} = spb_drv:close(Fd, Port),
+            ok = spb_drv:stop(Port)
+    end.
+
+test_write3(IpPort) ->
+    {ok, Port} = spb_drv:start(),
+    {ok, Fd} = spb_drv:listen("0.0.0.0", IpPort, Port),
+    Bin = <<-1:1024/native-unsigned>>,
+    Lst = lists:duplicate(2048, Bin),
+    {ok, Fd} = spb_drv:accept(Fd, Port),
+    receive
+        {spb_event, Port, {ok, Fd1}} ->
+            tw3(Port, Fd1, Lst, 16384),
+            timer:sleep(10000),
+            {closed, Fd1} = spb_drv:close(Fd1, Port),
+            {closed, Fd} = spb_drv:close(Fd, Port),
+            ok = spb_drv:stop(Port)
+    end.
+tw3(_Port, _Fd, _List, 0) ->
+    ok;
+tw3(Port, Fd, List, N) ->
+    spb_drv:write(Fd, Port, List),
+    case (N rem 4) of
+        0 -> timer:sleep(1);
+        _ -> ok
+    end,
+    tw3(Port, Fd, List, N-1).
 
 spawn_test(IpPort) ->
     spawn(fun () -> test(IpPort) end).
