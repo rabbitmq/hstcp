@@ -86,12 +86,12 @@ test_write2(IpPort) ->
 test_write3(IpPort) ->
     {ok, Port} = spb_drv:start(),
     {ok, Fd} = spb_drv:listen("0.0.0.0", IpPort, Port),
-    Bin = <<-1:1024/native-unsigned>>,
-    Lst = lists:duplicate(2048, Bin),
+    Bin = <<-1:8192/native-unsigned>>,
+    Lst = lists:duplicate(128, Bin),
     {ok, Fd} = spb_drv:accept(Fd, Port),
     receive
         {spb_event, Port, {ok, Fd1}} ->
-            tw3(Port, Fd1, Lst, 16384),
+            tw3(Port, Fd1, Lst, 65536),
             timer:sleep(10000),
             {closed, Fd1} = spb_drv:close(Fd1, Port),
             {closed, Fd} = spb_drv:close(Fd, Port),
@@ -101,10 +101,6 @@ tw3(_Port, _Fd, _List, 0) ->
     ok;
 tw3(Port, Fd, List, N) ->
     spb_drv:write(Fd, Port, List),
-    case (N rem 4) of
-        0 -> timer:sleep(1);
-        _ -> ok
-    end,
     tw3(Port, Fd, List, N-1).
 
 spawn_test(IpPort) ->
@@ -134,7 +130,9 @@ drain(Fd, Port, Start, Count, Size) ->
             {ClosedOrBadArg, Fd} = spb_drv:close(Fd, Port),
             %% ASSERTION: badarg if it's already been closed
             true = ClosedOrBadArg =:= closed orelse ClosedOrBadArg =:= badarg,
-            {Event, Count, Size}
+            {Event, Count, Size};
+        Other ->
+            Other
     end.
 
 start() ->

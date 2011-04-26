@@ -114,6 +114,7 @@ typedef struct {
 
 typedef struct {
   int64_t quota;
+  int64_t pending_writes;
   ErlDrvMutex *mutex;
   ErlIOVec *ev;
   ev_io *watcher;
@@ -555,17 +556,19 @@ void async_socket_write(SocketAction *const sa) {
     se = *se_ptr;
     erl_drv_mutex_lock(se->socket.connected_socket.mutex);
     erl_drv_mutex_unlock(sd->sockets_mutex);
-    ErlIOVec *ev_ptr = se->socket.connected_socket.ev;
-    if (0 == ev_ptr->size) {
+    int64_t ready = se->socket.connected_socket.pending_writes;
+    if (0 == ready) {
       /* huh, nothing to write after all. Oh well */
       erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
     } else {
+      ErlIOVec *ev_ptr = se->socket.connected_socket.ev;
       /* printf("before:\r\n"); */
       /* dump_ev(ev_ptr); */
 
       int iovcnt = ev_ptr->vsize > sd->iov_max ? sd->iov_max : ev_ptr->vsize;
-      ssize_t ready = ev_ptr->size;
-      ssize_t written = writev(fd, (const struct iovec *)ev_ptr->iov, iovcnt);
+      /* deliberate promotion from ssize_t to int64_t - matches ready */
+      int64_t written =
+        (int64_t)writev(fd, (const struct iovec *)ev_ptr->iov, iovcnt);
 
       if (0 > written) {
         return_socket_error_pid(sd, fd, errno, se->pid);
@@ -585,8 +588,8 @@ void async_socket_write(SocketAction *const sa) {
         driver_free(ev_ptr->binv);
         ev_ptr->iov = NULL;
         ev_ptr->binv = NULL;
-        ev_ptr->size = 0;
         ev_ptr->vsize = 0;
+        se->socket.connected_socket.pending_writes = 0;
         erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
 
       } else if (0 == written) {
@@ -598,11 +601,11 @@ void async_socket_write(SocketAction *const sa) {
         command_enqueue_and_notify(sa1, sd);
 
       } else {
-        int remaining = ev_ptr->size - written;
+        int64_t remaining = ready - written;
         int gone = 0;
-        ssize_t written2 = 0;
+        int64_t written2 = 0;
         for (int idx = 0; idx < ev_ptr->vsize; ++idx) {
-          written2 = written - ev_ptr->iov[idx].iov_len;
+          written2 = written - (int64_t)ev_ptr->iov[idx].iov_len;
           if (0 > written2) {
             /* the write stopped half way through an element */
             break;
@@ -626,7 +629,7 @@ void async_socket_write(SocketAction *const sa) {
                   vremaining * sizeof(SysIOVec));
           memmove(ev_ptr->binv, &(ev_ptr->binv[gone]),
                   vremaining * sizeof(ErlDrvBinary *));
-          ev_ptr->size  = remaining;
+          se->socket.connected_socket.pending_writes = remaining;
           ev_ptr->vsize = vremaining;
 
           ev_ptr->iov =
@@ -721,11 +724,13 @@ SocketEntry *connected_socket_create(const int fd, ErlDrvTermData pid,
   SocketEntry *const se = socket_entry_alloc(fd, pid, sd);
   se->type = CONNECTED_SOCKET;
   se->socket.connected_socket.quota = 0;
+  se->socket.connected_socket.pending_writes = 0;
   se->socket.connected_socket.ev =
     (ErlIOVec *)driver_alloc(sizeof(ErlIOVec));
   if (NULL == se->socket.connected_socket.ev)
     driver_failure(sd->port, -1);
   se->socket.connected_socket.ev->vsize = 0;
+  /* although size isn't even used as it's too small */
   se->socket.connected_socket.ev->size = 0;
   se->socket.connected_socket.ev->iov = NULL;
   se->socket.connected_socket.ev->binv = NULL;
@@ -824,7 +829,7 @@ static void spb_ev_socket_write_cb(EV_P_ ev_io *w, int revents) {
     erl_drv_mutex_unlock(sd->sockets_mutex);
     /* do we really have work to do? */
     ev_ptr = se->socket.connected_socket.ev;
-    if (NULL != ev_ptr && ev_ptr->size > 0) {
+    if (NULL != ev_ptr && se->socket.connected_socket.pending_writes > 0) {
       /* definitely have data to write, so call driver_async */
       erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
       SocketAction *sa = socket_action_alloc(SPB_ASYNC_WRITE, fd,
@@ -851,12 +856,14 @@ static void spb_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
     se = *se_ptr;
     erl_drv_mutex_unlock(sd->sockets_mutex);
     ErlDrvTermData pid = se->pid;
-    int bytes_ready = -1;
+    int bytes_ready_int = -1;
 
-    if (ioctl(fd, FIONREAD, &bytes_ready) < 0) {
+    if (ioctl(fd, FIONREAD, &bytes_ready_int) < 0) {
       return_socket_error_pid(sd, fd, errno, pid);
       return;
     }
+    /* promote type to match with quota later on */
+    int64_t bytes_ready = (int64_t)bytes_ready_int;
 
     if (0 == bytes_ready) {
       if (socket_entry_destroy(se, sd)) {
@@ -870,9 +877,9 @@ static void spb_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
       }
 
     } else {
-      int quota = se->socket.connected_socket.quota;
-      int requested = (0 <= quota && quota < bytes_ready) ? quota : bytes_ready;
-      ssize_t achieved = 0;
+      int64_t quota = se->socket.connected_socket.quota;
+      int64_t requested = (0 <= quota && quota < bytes_ready) ? quota : bytes_ready;
+      int64_t achieved = 0;
 
       ErlDrvBinary *binary = driver_alloc_binary(requested);
       if (NULL == binary)
@@ -1121,8 +1128,9 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
           se->socket.connected_socket.quota = new_quota;
           if (0 == new_quota && 0 != old_quota)
             ev_io_stop(sd->epoller, se->watcher);
-          else if (0 != new_quota && 0 == old_quota)
+          else if (0 != new_quota && 0 == old_quota) {
             ev_io_start(sd->epoller, se->watcher);
+          }
         } else {
           erl_drv_mutex_unlock(sd->sockets_mutex);
           return_socket_bad_pid(sd, fd, pid); /* programmer messed up */
@@ -1173,7 +1181,8 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
             ev_ptr->iov[old_offset + idx] = sa->ev->iov[new_offset + idx];
             ev_ptr->binv[old_offset + idx] = sa->ev->binv[new_offset + idx];
             /* we use size to mean writable size */
-            ev_ptr->size += sa->ev->iov[new_offset + idx].iov_len;
+            se->socket.connected_socket.pending_writes +=
+              (int64_t)sa->ev->iov[new_offset + idx].iov_len;
           }
           ev_ptr->vsize = total_length;
 
