@@ -199,8 +199,7 @@ write_server_client_streaming() ->
                         gen_tcp:close(Sock),
                         passed
                 end,
-                fun (_Sock, _FdPort) -> passed end
-               )
+                fun (_Sock, _FdPort) -> passed end)
       end).
 
 repeat_write(_Fd, _Port, _List, 0) ->
