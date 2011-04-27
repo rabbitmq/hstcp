@@ -180,6 +180,9 @@ write_server_client_streaming() ->
     Count = 65536,
     Bin = <<-1:1024/native-unsigned>>,
     Lst = lists:duplicate(128, Bin),
+    MD5 = erlang:md5_final(
+            lists:foldl(fun (_, Ctx) -> erlang:md5_update(Ctx, Lst) end,
+                        erlang:md5_init(), lists:duplicate(Count, ok))),
     twice(
       fun () ->
               with_connection(
@@ -193,11 +196,6 @@ write_server_client_streaming() ->
                                           end,
                                           erlang:md5_init()),
                         MD5 = erlang:md5_final(Context),
-                        MD5 = erlang:md5_final(
-                                lists:foldl(fun (_, Ctx) ->
-                                                    erlang:md5_update(Ctx, Lst)
-                                            end, erlang:md5_init(),
-                                            lists:duplicate(Count, ok))),
                         gen_tcp:close(Sock),
                         passed
                 end,
