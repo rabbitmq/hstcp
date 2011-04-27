@@ -30,7 +30,10 @@ start() ->
     erl_ddll:start(),
     {file, Path} = code:is_loaded(?MODULE),
     Dir = filename:join(filename:dirname(Path), "../priv"),
-    ok = erl_ddll:load_driver(Dir, ?LIBNAME),
+    case erl_ddll:load_driver(Dir, ?LIBNAME) of
+        ok                 -> ok;
+        {error, permanent} -> ok %% it's already loaded
+    end,
     Port = open_port({spawn_driver, ?LIBNAME}, [binary, stream]),
     %% The reply here actually comes up from the ev loop thread, and
     %% is worth waiting for.

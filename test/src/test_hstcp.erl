@@ -15,13 +15,21 @@
 %%
 
 -module(test_hstcp).
--compile({parse_transform, erlando}).
 
+-compile({parse_transform, erlando}).
 -compile([export_all]).
+
+-define(PORT, 5678).
 
 test() ->
     passed = do([test_m || start_stop(),
-                           start_listen_close_stop()]).
+                           start_listen_close_stop(),
+                           start_listen_accept_close_stop(),
+                           start_listen_accept_connect_close_close_stop_1(),
+                           start_listen_accept_connect_close_close_stop_2(),
+                           write_client_server(),
+                           write_server_client()
+                ]).
 
 start_stop() ->
     twice(fun () ->
@@ -33,11 +41,105 @@ start_stop() ->
 start_listen_close_stop() ->
     twice(fun () ->
                   {ok, Port} = hstcp_drv:start(),
-                  {ok, Fd} = hstcp_drv:listen("0.0.0.0", 5678, Port),
+                  {ok, Fd} = hstcp_drv:listen("0.0.0.0", ?PORT, Port),
                   {closed, Fd} = hstcp_drv:close(Fd, Port),
                   ok = hstcp_drv:stop(Port),
                   passed
           end).
+
+start_listen_accept_close_stop() ->
+    twice(fun () ->
+                  {ok, Port} = hstcp_drv:start(),
+                  {ok, Fd} = hstcp_drv:listen("0.0.0.0", ?PORT, Port),
+                  {ok, Fd} = hstcp_drv:accept(Fd, Port),
+                  {closed, Fd} = hstcp_drv:close(Fd, Port),
+                  ok = hstcp_drv:stop(Port),
+                  passed
+          end).
+
+start_listen_accept_connect_close_close_stop_1() ->
+    %% We get the client to disconnect first here.
+    twice(fun () ->
+                  with_connection(
+                    fun (Sock,  _FdPort) -> gen_tcp:close(Sock), passed end,
+                    fun (_Sock, _FdPort) ->                      passed end)
+          end).
+
+start_listen_accept_connect_close_close_stop_2() ->
+    %% We get the server to disconnect first here.
+    twice(fun () ->
+                  with_connection(
+                    fun (_Sock, _FdPort) ->                      passed end,
+                    fun (Sock,  _FdPort) -> gen_tcp:close(Sock), passed end)
+          end).
+
+write_client_server() ->
+    twice(fun () ->
+                  with_connection(
+                    fun (Sock, {Fd, Port}) ->
+                            Bin = <<"Hello World">>,
+                            ok = gen_tcp:send(Sock, Bin),
+                            Bin = receive_up_to(Fd, Port, size(Bin)),
+                            gen_tcp:close(Sock),
+                            passed
+                    end,
+                    fun (_Sock, _FdPort) -> passed end)
+          end).
+
+write_server_client() ->
+    twice(fun () ->
+                  with_connection(
+                    fun (Sock, {Fd, Port}) ->
+                            Bin = <<"Hello World">>,
+                            ok = hstcp_drv:write(Fd, Port, Bin),
+                            {ok, Bin} = gen_tcp:recv(Sock, size(Bin)),
+                            gen_tcp:close(Sock),
+                            passed
+                    end,
+                    fun (_Sock, _FdPort) -> passed end)
+          end).
+
+receive_up_to(Fd, Port, N) ->
+    ok = hstcp_drv:recv(N, Fd, Port),
+    receive_up_to(Fd, Port, N, []).
+
+receive_up_to(_Fd, _Port, 0, Lst) ->
+    list_to_binary(lists:reverse(Lst));
+receive_up_to(Fd, Port, N, Lst) when N > 0 ->
+    receive
+        {hstcp_event, Port, {data, Fd, Data}} ->
+            receive_up_to(Fd, Port, N - size(Data), [Data|Lst]);
+        {hstcp_event, Port, Event} ->
+            {error, Event}
+    end.
+
+acceptor(Parent, Fd, Port) ->
+    fun () ->
+            {ok, Fd} = hstcp_drv:accept(Fd, Port),
+            Fd1 = receive
+                      {hstcp_event, Port, {ok, Fd2}} -> Fd2
+                  end,
+            Parent ! {self(), connected},
+            receive {Parent, close, Connected, Closed, Sock} ->
+                    passed = Connected(Sock, {Fd1, Port}),
+                    {closed, Fd1} = hstcp_drv:close(Fd1, Port),
+                    passed = Closed(Sock, {Fd1, Port}),
+                    Parent ! {self(), closed}
+            end
+    end.
+
+with_connection(Connected, Closed) ->
+    {ok, Port} = hstcp_drv:start(),
+    {ok, Fd} = hstcp_drv:listen("0.0.0.0", ?PORT, Port),
+    Me = self(),
+    Pid = spawn(acceptor(Me, Fd, Port)),
+    {ok, Sock} = gen_tcp:connect("localhost", ?PORT,
+                                 [binary, {active, false}, {nodelay, true}]),
+    receive {Pid, connected} -> Pid ! {Me, close, Connected, Closed, Sock} end,
+    receive {Pid, closed}    -> ok end,
+    {closed, Fd} = hstcp_drv:close(Fd, Port),
+    ok = hstcp_drv:stop(Port),
+    passed.
 
 twice(Fun) ->
     passed = Fun(),
