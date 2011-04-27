@@ -10,7 +10,7 @@
 /*   License for the specific language governing rights and limitations      */
 /*   under the License.                                                      */
 /*                                                                           */
-/*   The Original Code is SPB.                                               */
+/*   The Original Code is HSTCP.                                               */
 /*                                                                           */
 /*   The Initial Developers of the Original Code are VMware, Inc.            */
 /*   Copyright (c) 2011-2011 VMware, Inc.  All rights reserved.              */
@@ -39,7 +39,7 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
-#include "spb.h"
+#include "hstcp.h"
 
 #define FALSE                  0
 #define TRUE                   1
@@ -65,28 +65,28 @@ typedef struct {
   ErlDrvPort     port;               /* driver port                                    */
   ErlDrvTermData pid;                /* driver pid                                     */
 
-  /* {'spb_event', Port, 'no_such_command'}                                            */
+  /* {'hstcp_event', Port, 'no_such_command'}                                            */
   ErlDrvTermData *no_such_command_atom_spec;
 
-  /* {'spb_event', Port, 'ok'}                                                         */
+  /* {'hstcp_event', Port, 'ok'}                                                         */
   ErlDrvTermData *ok_atom_spec;
 
-  /* {'spb_event', Port, {'reader_error', "string"}}                                   */
+  /* {'hstcp_event', Port, {'reader_error', "string"}}                                   */
   ErlDrvTermData *reader_error_spec; /* terms for errors from reader                   */
 
-  /* {'spb_event', Port, {'socket_error', Fd, "string"}}                               */
+  /* {'hstcp_event', Port, {'socket_error', Fd, "string"}}                               */
   ErlDrvTermData *socket_error_spec; /* terms for errors from socket                   */
 
-  /* {'spb_event', Port, {'ok', Fd}}                                                   */
+  /* {'hstcp_event', Port, {'ok', Fd}}                                                   */
   ErlDrvTermData *ok_fd_spec;        /* terms for ok results including a fd            */
 
-  /* {'spb_event', Port, {'data', Fd, Binary}}                                         */
+  /* {'hstcp_event', Port, {'data', Fd, Binary}}                                         */
   ErlDrvTermData *fd_data_spec;      /* terms for results including a fd and data      */
 
-  /* {'spb_event', Port, {'closed', Fd}}                                               */
+  /* {'hstcp_event', Port, {'closed', Fd}}                                               */
   ErlDrvTermData *fd_closed_spec;    /* terms for sending to a pid on socket close     */
 
-  /* {'spb_event', Port, {'badarg', Fd}}                                               */
+  /* {'hstcp_event', Port, {'badarg', Fd}}                                               */
   ErlDrvTermData *fd_bad_spec;       /* terms for sending to a pid on general error    */
 
   struct ev_loop *epoller;           /* our ev loop                                    */
@@ -99,7 +99,7 @@ typedef struct {
   ErlDrvCond     *cond;              /* conditional for signalling from thread to drv  */
   int            iov_max;
   int            socket_entry_serial;
-} SpbData;
+} HstcpData;
 
 typedef struct {
   ErlIOVec *ev;
@@ -140,14 +140,14 @@ typedef struct {
   uint8_t        done;
   uint8_t        free_when_done;
   int64_t        value;
-  SpbData        *sd;
+  HstcpData        *sd;
   ErlIOVec       *ev;
   ErlDrvCond     *cond;
   ErlDrvMutex    *mutex;
   ErlDrvTermData pid;
 } SocketAction;
 
-uint8_t spb_invalid_command = SPB_INVALID_COMMAND;
+uint8_t hstcp_invalid_command = HSTCP_INVALID_COMMAND;
 
 
 /**********************
@@ -243,7 +243,7 @@ int read_binary(Reader *const reader, const char **const result,
   }
 }
 
-void return_reader_error(SpbData *const sd, const Reader *const reader) {
+void return_reader_error(HstcpData *const sd, const Reader *const reader) {
   const char* error_str;
   if (NULL == reader) {
     error_str = "Null reader";
@@ -274,14 +274,14 @@ void return_reader_error(SpbData *const sd, const Reader *const reader) {
  *  Misc Synchronisation  *
  **************************/
 
-void await_non_null(const void *const *const ptr, SpbData *const sd) {
+void await_non_null(const void *const *const ptr, HstcpData *const sd) {
   erl_drv_mutex_lock(sd->command_mutex);
   while (NULL != ptr && NULL == *ptr)
     erl_drv_cond_wait(sd->cond, sd->command_mutex);
   erl_drv_mutex_unlock(sd->command_mutex);
 }
 
-void await_epoller(SpbData *const sd) {
+void await_epoller(HstcpData *const sd) {
   await_non_null((const void const* const*)&(sd->epoller), sd);
 }
 
@@ -313,7 +313,7 @@ void await_done(SocketAction *sa) {
 void socket_action_new(SocketAction *const sa,
                        const uint8_t type, const int fd,
                        ErlDrvCond *const cond, ErlDrvMutex *const mutex,
-                       ErlDrvTermData pid, SpbData *const sd) {
+                       ErlDrvTermData pid, HstcpData *const sd) {
   sa->fd = fd;
   sa->type = type;
   sa->done = FALSE;
@@ -329,7 +329,7 @@ void socket_action_new(SocketAction *const sa,
 SocketAction *socket_action_alloc(const uint8_t type, const int fd,
                                   ErlDrvCond *const cond,
                                   ErlDrvMutex *const mutex,
-                                  ErlDrvTermData pid, SpbData *const sd) {
+                                  ErlDrvTermData pid, HstcpData *const sd) {
   SocketAction *sa = (SocketAction *)driver_alloc(sizeof(SocketAction));
   if (NULL == sa)
     driver_failure(sd->port, -1);
@@ -338,7 +338,7 @@ SocketAction *socket_action_alloc(const uint8_t type, const int fd,
   return sa;
 }
 
-void command_enqueue_and_notify(SocketAction *const sa, SpbData *const sd) {
+void command_enqueue_and_notify(SocketAction *const sa, HstcpData *const sd) {
   erl_drv_mutex_lock(sd->command_mutex);
   SocketAction **sa_ptr = NULL;
   Word_t index = -1;
@@ -354,7 +354,7 @@ void command_enqueue_and_notify(SocketAction *const sa, SpbData *const sd) {
   ev_async_send(sd->epoller, sd->async_watcher);
 }
 
-void command_dequeue(SocketAction **sa, SpbData *const sd) {
+void command_dequeue(SocketAction **sa, HstcpData *const sd) {
   erl_drv_mutex_lock(sd->command_mutex);
   SocketAction **sa_ptr = NULL;
   Word_t index = 0;
@@ -375,21 +375,21 @@ void command_dequeue(SocketAction **sa, SpbData *const sd) {
  *  Sending back to Erlang  *
  ****************************/
 
-void return_socket_closed_pid(SpbData *const sd, const int fd,
+void return_socket_closed_pid(HstcpData *const sd, const int fd,
                               ErlDrvTermData pid) {
   sd->fd_closed_spec[7] = (ErlDrvSInt)fd;
   driver_send_term(sd->port, pid, sd->fd_closed_spec, FD_CLOSED_SPEC_LEN);
   sd->fd_closed_spec[7] = 0;
 }
 
-void return_socket_bad_pid(SpbData *const sd, const int fd,
+void return_socket_bad_pid(HstcpData *const sd, const int fd,
                            ErlDrvTermData pid) {
   sd->fd_bad_spec[7] = (ErlDrvSInt)fd;
   driver_send_term(sd->port, pid, sd->fd_bad_spec, FD_BAD_SPEC_LEN);
   sd->fd_bad_spec[7] = 0;
 }
 
-void return_socket_error_str_pid(SpbData *const sd, const int fd,
+void return_socket_error_str_pid(HstcpData *const sd, const int fd,
                                  const char* error_str, ErlDrvTermData pid) {
   sd->socket_error_spec[7] = (ErlDrvSInt)fd;
   sd->socket_error_spec[9] = (ErlDrvTermData)error_str;
@@ -400,12 +400,12 @@ void return_socket_error_str_pid(SpbData *const sd, const int fd,
   sd->socket_error_spec[10] = 0;
 }
 
-void return_socket_error_pid(SpbData *const sd, const int fd, const int error,
+void return_socket_error_pid(HstcpData *const sd, const int fd, const int error,
                              ErlDrvTermData pid) {
   return_socket_error_str_pid(sd, fd, strerror(error), pid);
 }
 
-void return_ok_fd_pid(SpbData *const sd, ErlDrvTermData pid, const int fd) {
+void return_ok_fd_pid(HstcpData *const sd, ErlDrvTermData pid, const int fd) {
   sd->ok_fd_spec[7] = fd;
   driver_send_term(sd->port, pid, sd->ok_fd_spec, OK_FD_SPEC_LEN);
   sd->ok_fd_spec[7] = 0;
@@ -423,7 +423,7 @@ int setnonblock(const int fd) { /* and turn off nagle */
   return fcntl(fd, F_SETFL, flags);
 }
 
-void socket_listen(SpbData *const sd, Reader *const reader) {
+void socket_listen(HstcpData *const sd, Reader *const reader) {
   const char *address = NULL;
   const uint64_t *address_len = NULL;
 
@@ -500,41 +500,41 @@ void socket_listen(SpbData *const sd, Reader *const reader) {
     return;
   }
 
-  SocketAction *sa = socket_action_alloc(SPB_ASYNC_LISTEN, listen_fd,
+  SocketAction *sa = socket_action_alloc(HSTCP_ASYNC_LISTEN, listen_fd,
                                          NULL, NULL, sd->pid, sd);
   command_enqueue_and_notify(sa, sd);
 }
 
-void socket_close(SpbData *const sd, Reader *const reader) {
+void socket_close(HstcpData *const sd, Reader *const reader) {
   const int64_t *fd64_ptr = NULL;
   if (! read_int64(reader, &fd64_ptr)) {
     return_reader_error(sd, reader);
     return;
   }
-  SocketAction *sa = socket_action_alloc(SPB_ASYNC_CLOSE, (int)*fd64_ptr,
+  SocketAction *sa = socket_action_alloc(HSTCP_ASYNC_CLOSE, (int)*fd64_ptr,
                                          NULL, NULL, sd->pid, sd);
   command_enqueue_and_notify(sa, sd);
 }
 
-void socket_accept(SpbData *const sd, Reader *const reader) {
+void socket_accept(HstcpData *const sd, Reader *const reader) {
   const int64_t *fd64_ptr = NULL;
   if (! read_int64(reader, &fd64_ptr)) {
     return_reader_error(sd, reader);
     return;
   }
-  SocketAction *sa = socket_action_alloc(SPB_ASYNC_ACCEPT, (int)*fd64_ptr,
+  SocketAction *sa = socket_action_alloc(HSTCP_ASYNC_ACCEPT, (int)*fd64_ptr,
                                          NULL, NULL, sd->pid, sd);
   command_enqueue_and_notify(sa, sd);
 }
 
-void socket_recv(SpbData *const sd, Reader *const reader) {
+void socket_recv(HstcpData *const sd, Reader *const reader) {
   const int64_t *fd64_ptr = NULL;
   const int64_t *bytes_ptr = NULL;
   if (! (read_int64(reader, &fd64_ptr) && read_int64(reader, &bytes_ptr))) {
     return_reader_error(sd, reader);
     return;
   }
-  SocketAction *sa = socket_action_alloc(SPB_ASYNC_RECV, (int)*fd64_ptr,
+  SocketAction *sa = socket_action_alloc(HSTCP_ASYNC_RECV, (int)*fd64_ptr,
                                          NULL, NULL, sd->pid, sd);
   sa->value = *bytes_ptr;
   command_enqueue_and_notify(sa, sd);
@@ -542,7 +542,7 @@ void socket_recv(SpbData *const sd, Reader *const reader) {
 
 void async_socket_write(SocketAction *const sa) {
   const int fd = sa->fd;
-  SpbData *const sd = sa->sd;
+  HstcpData *const sd = sa->sd;
   mark_done_and_signal(sa);
 
   SocketEntry **se_ptr = NULL;
@@ -576,7 +576,7 @@ void async_socket_write(SocketAction *const sa) {
 
         close(fd);
 
-        SocketAction *sa1 = socket_action_alloc(SPB_ASYNC_DESTROY_SOCKET, fd,
+        SocketAction *sa1 = socket_action_alloc(HSTCP_ASYNC_DESTROY_SOCKET, fd,
                                                 NULL, NULL, se->pid, sd);
         command_enqueue_and_notify(sa1, sd);
 
@@ -596,7 +596,7 @@ void async_socket_write(SocketAction *const sa) {
         erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
 
 
-        SocketAction *sa1 = socket_action_alloc(SPB_ASYNC_INCOMPLETE_WRITE, fd,
+        SocketAction *sa1 = socket_action_alloc(HSTCP_ASYNC_INCOMPLETE_WRITE, fd,
                                                 NULL, NULL, se->pid, sd);
         command_enqueue_and_notify(sa1, sd);
 
@@ -654,7 +654,7 @@ void async_socket_write(SocketAction *const sa) {
 
         erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
 
-        SocketAction *sa1 = socket_action_alloc(SPB_ASYNC_INCOMPLETE_WRITE, fd,
+        SocketAction *sa1 = socket_action_alloc(HSTCP_ASYNC_INCOMPLETE_WRITE, fd,
                                                 NULL, NULL, se->pid, sd);
         command_enqueue_and_notify(sa1, sd);
       }
@@ -664,7 +664,7 @@ void async_socket_write(SocketAction *const sa) {
   }
 }
 
-void socket_write(SpbData *const sd, Reader *const reader) {
+void socket_write(HstcpData *const sd, Reader *const reader) {
   const int64_t *fd64_ptr = NULL;
   if (! read_int64(reader, &fd64_ptr)) {
     /* write is async so just drop this silently! */
@@ -675,7 +675,7 @@ void socket_write(SpbData *const sd, Reader *const reader) {
      the stack, and use the mutex and cond. */
 
   SocketAction sa;
-  socket_action_new(&sa, SPB_ASYNC_WRITE, (int)*fd64_ptr,
+  socket_action_new(&sa, HSTCP_ASYNC_WRITE, (int)*fd64_ptr,
                     sd->cond, sd->command_mutex, sd->pid, sd);
   sa.ev = reader->ev;
   command_enqueue_and_notify(&sa, sd);
@@ -687,12 +687,12 @@ void socket_write(SpbData *const sd, Reader *const reader) {
  *  ev_loop callbacks  *
  ***********************/
 
-static void spb_ev_socket_write_cb(EV_P_ ev_io *, int);
-static void spb_ev_socket_read_cb(EV_P_ ev_io *, int);
-static void spb_ev_listen_cb(EV_P_ ev_io *, int);
+static void hstcp_ev_socket_write_cb(EV_P_ ev_io *, int);
+static void hstcp_ev_socket_read_cb(EV_P_ ev_io *, int);
+static void hstcp_ev_listen_cb(EV_P_ ev_io *, int);
 
 SocketEntry *socket_entry_alloc(const int fd, ErlDrvTermData pid,
-                                SpbData *const sd) {
+                                HstcpData *const sd) {
   SocketEntry *const se = (SocketEntry*)driver_alloc(sizeof(SocketEntry));
   if (NULL == se)
     driver_failure(sd->port, -1);
@@ -709,18 +709,18 @@ SocketEntry *socket_entry_alloc(const int fd, ErlDrvTermData pid,
 }
 
 SocketEntry *listen_socket_create(const int fd, ErlDrvTermData pid,
-                                  SpbData *const sd) {
+                                  HstcpData *const sd) {
   SocketEntry *const se = socket_entry_alloc(fd, pid, sd);
   se->type = LISTEN_SOCKET;
   se->socket.listen_socket.acceptors = (Pvoid_t)NULL;
-  ev_io_init(se->watcher, spb_ev_listen_cb, fd, EV_READ);
+  ev_io_init(se->watcher, hstcp_ev_listen_cb, fd, EV_READ);
   se->watcher->data = sd;
 
   return se;
 }
 
 SocketEntry *connected_socket_create(const int fd, ErlDrvTermData pid,
-                                     SpbData *const sd) {
+                                     HstcpData *const sd) {
   SocketEntry *const se = socket_entry_alloc(fd, pid, sd);
   se->type = CONNECTED_SOCKET;
   se->socket.connected_socket.quota = 0;
@@ -734,7 +734,7 @@ SocketEntry *connected_socket_create(const int fd, ErlDrvTermData pid,
   se->socket.connected_socket.ev->size = 0;
   se->socket.connected_socket.ev->iov = NULL;
   se->socket.connected_socket.ev->binv = NULL;
-  se->socket.connected_socket.mutex = erl_drv_mutex_create("spb socket mutex");
+  se->socket.connected_socket.mutex = erl_drv_mutex_create("hstcp socket mutex");
   if (NULL == se->socket.connected_socket.mutex)
     driver_failure(sd->port, -1);
 
@@ -743,12 +743,12 @@ SocketEntry *connected_socket_create(const int fd, ErlDrvTermData pid,
   if (NULL == se->socket.connected_socket.watcher)
     driver_failure(sd->port, -1);
 
-  ev_io_init(se->socket.connected_socket.watcher, spb_ev_socket_write_cb, fd,
+  ev_io_init(se->socket.connected_socket.watcher, hstcp_ev_socket_write_cb, fd,
              EV_WRITE);
   se->socket.connected_socket.watcher->data = sd;
 
   /* setup the read watcher (alloc'd in socket_entry_alloc) */
-  ev_io_init(se->watcher, spb_ev_socket_read_cb, fd, EV_READ);
+  ev_io_init(se->watcher, hstcp_ev_socket_read_cb, fd, EV_READ);
   se->watcher->data = sd;
 
   return se;
@@ -760,7 +760,7 @@ void free_binaries(const ErlIOVec *const ev) {
   }
 }
 
-int socket_entry_destroy(SocketEntry *se, SpbData *const sd) {
+int socket_entry_destroy(SocketEntry *se, HstcpData *const sd) {
   const int fd = se->fd;
   SocketEntry **se_ptr = NULL;
 
@@ -811,9 +811,9 @@ int socket_entry_destroy(SocketEntry *se, SpbData *const sd) {
   }
 }
 
-static void spb_ev_socket_write_cb(EV_P_ ev_io *w, int revents) {
+static void hstcp_ev_socket_write_cb(EV_P_ ev_io *w, int revents) {
   ev_io_stop(EV_A_ w); /* stop the watcher immediately */
-  SpbData *const sd = (SpbData *const)(w->data);
+  HstcpData *const sd = (HstcpData *const)(w->data);
   const int fd = w->fd;
   SocketEntry **se_ptr = NULL;
   SocketEntry *se = NULL;
@@ -832,7 +832,7 @@ static void spb_ev_socket_write_cb(EV_P_ ev_io *w, int revents) {
     if (NULL != ev_ptr && se->socket.connected_socket.pending_writes > 0) {
       /* definitely have data to write, so call driver_async */
       erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
-      SocketAction *sa = socket_action_alloc(SPB_ASYNC_WRITE, fd,
+      SocketAction *sa = socket_action_alloc(HSTCP_ASYNC_WRITE, fd,
                                               NULL, NULL, se->pid, sd);
       driver_async(sd->port, (unsigned int *)&(sa->fd),
                    (void (*)(void *))async_socket_write, sa, NULL);
@@ -842,8 +842,8 @@ static void spb_ev_socket_write_cb(EV_P_ ev_io *w, int revents) {
   }
 }
 
-static void spb_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
-  SpbData *const sd = (SpbData *const)(w->data);
+static void hstcp_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
+  HstcpData *const sd = (HstcpData *const)(w->data);
   const int fd = w->fd;
   SocketEntry **se_ptr = NULL;
   SocketEntry *se = NULL;
@@ -925,8 +925,8 @@ static void spb_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
   }
 }
 
-static void spb_ev_listen_cb(EV_P_ ev_io *w, int revents) {
-  SpbData *const sd = (SpbData *const)(w->data);
+static void hstcp_ev_listen_cb(EV_P_ ev_io *w, int revents) {
+  HstcpData *const sd = (HstcpData *const)(w->data);
   const int fd = w->fd;
   SocketEntry **se_ptr = NULL;
   SocketEntry *se = NULL;
@@ -945,7 +945,7 @@ static void spb_ev_listen_cb(EV_P_ ev_io *w, int revents) {
 
     if (NULL != pid_ptr && NULL != *pid_ptr) {
       const ErlDrvTermData pid = **pid_ptr; /* copy out pid */
-      driver_free(*pid_ptr); /* was allocated in SPB_ASYNC_ACCEPT */
+      driver_free(*pid_ptr); /* was allocated in HSTCP_ASYNC_ACCEPT */
 
       int rc = 0; /* delete that entry from acceptors */
       JLD(rc, se->socket.listen_socket.acceptors, index);
@@ -990,26 +990,26 @@ static void spb_ev_listen_cb(EV_P_ ev_io *w, int revents) {
   }
 }
 
-static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
-  SpbData *const sd = (SpbData *const)(w->data);
+static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
+  HstcpData *const sd = (HstcpData *const)(w->data);
   SocketAction *sa = NULL;
   command_dequeue(&sa, sd);
   while (NULL != sa) {
    switch (sa->type) {
 
-    case SPB_ASYNC_START:
+    case HSTCP_ASYNC_START:
       mark_done_and_signal(sa);
       driver_send_term(sd->port, sa->pid, sd->ok_atom_spec, ATOM_SPEC_LEN);
       break;
 
-    case SPB_ASYNC_EXIT:
+    case HSTCP_ASYNC_EXIT:
       mark_done_and_signal(sa);
       ev_async_stop(EV_A_ w);
       ev_unloop(EV_A_ EVUNLOOP_ALL);
       ev_loop_destroy(EV_A);
       break;
 
-    case SPB_ASYNC_LISTEN:
+    case HSTCP_ASYNC_LISTEN:
       {
         /* The main driver thread has done the open, so if we've got
            this far, we know the socket was opened successfully */
@@ -1026,7 +1026,7 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
         break;
       }
 
-    case SPB_ASYNC_CLOSE:
+    case HSTCP_ASYNC_CLOSE:
       {
         /* Note the same close code is used for listening and connected
            sockets */
@@ -1060,7 +1060,7 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
         break;
       }
 
-    case SPB_ASYNC_ACCEPT:
+    case HSTCP_ASYNC_ACCEPT:
       {
         const int fd = sa->fd;
         const ErlDrvTermData pid = sa->pid;
@@ -1108,7 +1108,7 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
         break;
       }
 
-    case SPB_ASYNC_RECV:
+    case HSTCP_ASYNC_RECV:
       {
         const int fd = sa->fd;
         const int64_t new_quota = sa->value;
@@ -1138,7 +1138,7 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
         break;
       }
 
-    case SPB_ASYNC_WRITE:
+    case HSTCP_ASYNC_WRITE:
       {
         /* need to copy out and extend the writer's ev before we can
            release the driver */
@@ -1189,7 +1189,7 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
           erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
 
           if (0 == old_offset) {
-            SocketAction *sa1 = socket_action_alloc(SPB_ASYNC_WRITE, sa->fd,
+            SocketAction *sa1 = socket_action_alloc(HSTCP_ASYNC_WRITE, sa->fd,
                                                     NULL, NULL, sa->pid, sd);
             mark_done_and_signal(sa);
             driver_async(sd->port, (unsigned int *)&(sa1->fd),
@@ -1204,7 +1204,7 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
         break;
       }
 
-    case SPB_ASYNC_INCOMPLETE_WRITE:
+    case HSTCP_ASYNC_INCOMPLETE_WRITE:
       {
         const int fd = sa->fd;
         mark_done_and_signal(sa);
@@ -1218,7 +1218,7 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
         break;
       }
 
-    case SPB_ASYNC_DESTROY_SOCKET:
+    case HSTCP_ASYNC_DESTROY_SOCKET:
       {
         const int fd = sa->fd;
         const ErlDrvTermData pid = sa->pid;
@@ -1250,8 +1250,8 @@ static void spb_ev_async_cb(EV_P_ ev_async *w, int revents) {
  *  ev_loop thread entry point  *
  ********************************/
 
-static void *spb_ev_start(void *arg) {
-  SpbData *const sd = (SpbData*)arg;
+static void *hstcp_ev_start(void *arg) {
+  HstcpData *const sd = (HstcpData*)arg;
 
   erl_drv_mutex_lock(sd->command_mutex);
 
@@ -1263,7 +1263,7 @@ static void *spb_ev_start(void *arg) {
   if (NULL == sd->async_watcher)
     driver_failure(sd->port, -1);
 
-  ev_async_init(sd->async_watcher, &spb_ev_async_cb);
+  ev_async_init(sd->async_watcher, &hstcp_ev_async_cb);
   sd->async_watcher->data = sd;
   ev_async_start(sd->epoller, sd->async_watcher);
 
@@ -1279,30 +1279,30 @@ static void *spb_ev_start(void *arg) {
  *  Erlang Driver Callbacks  *
  *****************************/
 
-static int spb_init() {
+static int hstcp_init() {
   ErlDrvSysInfo info;
   driver_system_info(&info, sizeof(ErlDrvSysInfo));
 
   if (0 == info.thread_support) {
-    perror("spb cannot load: spb requires thread support\r\n");
+    perror("hstcp cannot load: hstcp requires thread support\r\n");
     return -1;
   }
 
   if (0 == info.smp_support) {
-    perror("spb cannot load: spb requires SMP support\r\n");
+    perror("hstcp cannot load: hstcp requires SMP support\r\n");
     return -1;
   }
 
   if (0 == info.async_threads) {
-    perror("spb cannot load: spb requires async threads\r\n");
+    perror("hstcp cannot load: hstcp requires async threads\r\n");
     return -1;
   }
 
   return 0;
 }
 
-static ErlDrvData spb_start(const ErlDrvPort port, char *const buff) {
-  SpbData *const sd = (SpbData*)driver_alloc(sizeof(SpbData));
+static ErlDrvData hstcp_start(const ErlDrvPort port, char *const buff) {
+  HstcpData *const sd = (HstcpData*)driver_alloc(sizeof(HstcpData));
 
   if (NULL == sd)
     return ERL_DRV_ERROR_GENERAL;
@@ -1317,7 +1317,7 @@ static ErlDrvData spb_start(const ErlDrvPort port, char *const buff) {
     return ERL_DRV_ERROR_GENERAL;
 
   sd->no_such_command_atom_spec[0] = ERL_DRV_ATOM;
-  sd->no_such_command_atom_spec[1] = driver_mk_atom("spb_event");
+  sd->no_such_command_atom_spec[1] = driver_mk_atom("hstcp_event");
   sd->no_such_command_atom_spec[2] = ERL_DRV_PORT;
   sd->no_such_command_atom_spec[3] = driver_mk_port(port);
   sd->no_such_command_atom_spec[4] = ERL_DRV_ATOM;
@@ -1332,7 +1332,7 @@ static ErlDrvData spb_start(const ErlDrvPort port, char *const buff) {
     return ERL_DRV_ERROR_GENERAL;
 
   sd->ok_atom_spec[0] = ERL_DRV_ATOM;
-  sd->ok_atom_spec[1] = driver_mk_atom("spb_event");
+  sd->ok_atom_spec[1] = driver_mk_atom("hstcp_event");
   sd->ok_atom_spec[2] = ERL_DRV_PORT;
   sd->ok_atom_spec[3] = driver_mk_port(port);
   sd->ok_atom_spec[4] = ERL_DRV_ATOM;
@@ -1347,7 +1347,7 @@ static ErlDrvData spb_start(const ErlDrvPort port, char *const buff) {
     return ERL_DRV_ERROR_GENERAL;
 
   sd->reader_error_spec[0] = ERL_DRV_ATOM;
-  sd->reader_error_spec[1] = driver_mk_atom("spb_event");
+  sd->reader_error_spec[1] = driver_mk_atom("hstcp_event");
   sd->reader_error_spec[2] = ERL_DRV_PORT;
   sd->reader_error_spec[3] = driver_mk_port(port);
   sd->reader_error_spec[4] = ERL_DRV_ATOM;
@@ -1367,7 +1367,7 @@ static ErlDrvData spb_start(const ErlDrvPort port, char *const buff) {
     return ERL_DRV_ERROR_GENERAL;
 
   sd->socket_error_spec[0] = ERL_DRV_ATOM;
-  sd->socket_error_spec[1] = driver_mk_atom("spb_event");
+  sd->socket_error_spec[1] = driver_mk_atom("hstcp_event");
   sd->socket_error_spec[2] = ERL_DRV_PORT;
   sd->socket_error_spec[3] = driver_mk_port(port);
   sd->socket_error_spec[4] = ERL_DRV_ATOM;
@@ -1389,7 +1389,7 @@ static ErlDrvData spb_start(const ErlDrvPort port, char *const buff) {
     return ERL_DRV_ERROR_GENERAL;
 
   sd->ok_fd_spec[0] = ERL_DRV_ATOM;
-  sd->ok_fd_spec[1] = driver_mk_atom("spb_event");
+  sd->ok_fd_spec[1] = driver_mk_atom("hstcp_event");
   sd->ok_fd_spec[2] = ERL_DRV_PORT;
   sd->ok_fd_spec[3] = driver_mk_port(port);
   sd->ok_fd_spec[4] = ERL_DRV_ATOM;
@@ -1408,7 +1408,7 @@ static ErlDrvData spb_start(const ErlDrvPort port, char *const buff) {
     return ERL_DRV_ERROR_GENERAL;
 
   sd->fd_data_spec[0] = ERL_DRV_ATOM;
-  sd->fd_data_spec[1] = driver_mk_atom("spb_event");
+  sd->fd_data_spec[1] = driver_mk_atom("hstcp_event");
   sd->fd_data_spec[2] = ERL_DRV_PORT;
   sd->fd_data_spec[3] = driver_mk_port(port);
   sd->fd_data_spec[4] = ERL_DRV_ATOM;
@@ -1431,7 +1431,7 @@ static ErlDrvData spb_start(const ErlDrvPort port, char *const buff) {
     return ERL_DRV_ERROR_GENERAL;
 
   sd->fd_closed_spec[0] = ERL_DRV_ATOM;
-  sd->fd_closed_spec[1] = driver_mk_atom("spb_event");
+  sd->fd_closed_spec[1] = driver_mk_atom("hstcp_event");
   sd->fd_closed_spec[2] = ERL_DRV_PORT;
   sd->fd_closed_spec[3] = driver_mk_port(port);
   sd->fd_closed_spec[4] = ERL_DRV_ATOM;
@@ -1450,7 +1450,7 @@ static ErlDrvData spb_start(const ErlDrvPort port, char *const buff) {
     return ERL_DRV_ERROR_GENERAL;
 
   sd->fd_bad_spec[0] = ERL_DRV_ATOM;
-  sd->fd_bad_spec[1] = driver_mk_atom("spb_event");
+  sd->fd_bad_spec[1] = driver_mk_atom("hstcp_event");
   sd->fd_bad_spec[2] = ERL_DRV_PORT;
   sd->fd_bad_spec[3] = driver_mk_port(port);
   sd->fd_bad_spec[4] = ERL_DRV_ATOM;
@@ -1476,17 +1476,17 @@ static ErlDrvData spb_start(const ErlDrvPort port, char *const buff) {
      that point, everything truly is up and running.
   */
   sd->epoller = NULL;
-  sd->command_mutex = erl_drv_mutex_create("spb command mutex");
+  sd->command_mutex = erl_drv_mutex_create("hstcp command mutex");
   if (NULL == sd->command_mutex)
     return ERL_DRV_ERROR_GENERAL;
   sd->command_queue = (Pvoid_t)NULL;
 
-  sd->cond = erl_drv_cond_create("spb command condition");
+  sd->cond = erl_drv_cond_create("hstcp command condition");
   if (NULL == sd->cond)
     return ERL_DRV_ERROR_GENERAL;
 
   sd->sockets = (Pvoid_t)NULL;
-  sd->sockets_mutex = erl_drv_mutex_create("spb sockets mutex");
+  sd->sockets_mutex = erl_drv_mutex_create("hstcp sockets mutex");
   if (NULL == sd->sockets_mutex)
     return ERL_DRV_ERROR_GENERAL;
 
@@ -1500,21 +1500,21 @@ static ErlDrvData spb_start(const ErlDrvPort port, char *const buff) {
 
   sd->socket_entry_serial = 0;
 
-  if (0 != erl_drv_thread_create("spb", &(sd->tid), &spb_ev_start, sd, NULL))
+  if (0 != erl_drv_thread_create("hstcp", &(sd->tid), &hstcp_ev_start, sd, NULL))
     return ERL_DRV_ERROR_GENERAL;
 
   await_epoller(sd);
-  SocketAction *sa = socket_action_alloc(SPB_ASYNC_START, 0, NULL, NULL,
+  SocketAction *sa = socket_action_alloc(HSTCP_ASYNC_START, 0, NULL, NULL,
                                          sd->pid, sd);
   command_enqueue_and_notify(sa, sd);
 
   return (ErlDrvData)sd;
 }
 
-static void spb_stop(const ErlDrvData drv_data) {
-  SpbData *const sd = (SpbData*)drv_data;
+static void hstcp_stop(const ErlDrvData drv_data) {
+  HstcpData *const sd = (HstcpData*)drv_data;
 
-  SocketAction *sa = socket_action_alloc(SPB_ASYNC_EXIT, 0, NULL, NULL,
+  SocketAction *sa = socket_action_alloc(HSTCP_ASYNC_EXIT, 0, NULL, NULL,
                                          sd->pid, sd);
   command_enqueue_and_notify(sa, sd);
   erl_drv_thread_join(sd->tid, NULL);
@@ -1540,10 +1540,10 @@ static void spb_stop(const ErlDrvData drv_data) {
   driver_free((char*)drv_data);
 }
 
-static void spb_outputv(ErlDrvData drv_data, ErlIOVec *const ev) {
-  SpbData *const sd = (SpbData*)drv_data;
+static void hstcp_outputv(ErlDrvData drv_data, ErlIOVec *const ev) {
+  HstcpData *const sd = (HstcpData*)drv_data;
   sd->pid = driver_caller(sd->port);
-  const uint8_t* command = &spb_invalid_command;
+  const uint8_t* command = &hstcp_invalid_command;
   Reader reader;
   make_reader(ev, &reader);
   ErlDrvTermData* spec = NULL;
@@ -1551,23 +1551,23 @@ static void spb_outputv(ErlDrvData drv_data, ErlIOVec *const ev) {
   if (read_uint8(&reader, &command)) {
     switch (*command) {
 
-    case SPB_LISTEN:
+    case HSTCP_LISTEN:
       socket_listen(sd, &reader);
       break;
 
-    case SPB_CLOSE:
+    case HSTCP_CLOSE:
       socket_close(sd, &reader);
       break;
 
-    case SPB_ACCEPT:
+    case HSTCP_ACCEPT:
       socket_accept(sd, &reader);
       break;
 
-    case SPB_RECV:
+    case HSTCP_RECV:
       socket_recv(sd, &reader);
       break;
 
-    case SPB_WRITE:
+    case HSTCP_WRITE:
       socket_write(sd, &reader);
       break;
 
@@ -1584,22 +1584,22 @@ static void spb_outputv(ErlDrvData drv_data, ErlIOVec *const ev) {
 
 }
 
-static ErlDrvEntry spb_driver_entry =
+static ErlDrvEntry hstcp_driver_entry =
 {
-  .init = spb_init,
-  .start = spb_start,
-  .stop = spb_stop,
-  .driver_name = (char*) "libspb",
-  .outputv = spb_outputv,
+  .init = hstcp_init,
+  .start = hstcp_start,
+  .stop = hstcp_stop,
+  .driver_name = (char*) "libhstcp",
+  .outputv = hstcp_outputv,
   .extended_marker = ERL_DRV_EXTENDED_MARKER,
   .major_version = ERL_DRV_EXTENDED_MAJOR_VERSION,
   .minor_version = ERL_DRV_EXTENDED_MINOR_VERSION,
   .driver_flags = ERL_DRV_FLAG_USE_PORT_LOCKING
 };
 
-DRIVER_INIT (libspb);
+DRIVER_INIT (libhstcp);
 
-DRIVER_INIT (libspb) /* must match name in driver_entry */
+DRIVER_INIT (libhstcp) /* must match name in driver_entry */
 {
-  return &spb_driver_entry;
+  return &hstcp_driver_entry;
 }

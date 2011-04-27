@@ -1,5 +1,5 @@
 C_SOURCE_DIR:=$(PACKAGE_DIR)/c_src
-LIBRARY:=$(C_SOURCE_DIR)/libspb.so
+LIBRARY:=$(C_SOURCE_DIR)/libhstcp.so
 C_SOURCE:=$(wildcard $(C_SOURCE_DIR)/*.c)
 C_HEADERS:=$(wildcard $(C_SOURCE_DIR)/*.h)
 
