@@ -29,7 +29,8 @@ test() ->
                            start_listen_accept_connect_close_close_stop_2(),
                            write_client_server(),
                            write_server_client(),
-                           write_server_client_variations()
+                           write_server_client_variations(),
+                           write_server_client_one_big()
                 ]).
 
 start_stop() ->
@@ -80,7 +81,11 @@ write_client_server() ->
                     fun (Sock, {Fd, Port}) ->
                             Bin = <<"Hello World">>,
                             ok = gen_tcp:send(Sock, Bin),
-                            Bin = receive_up_to(Fd, Port, size(Bin)),
+                            ok = hstcp_drv:recv(size(Bin), Fd, Port),
+                            BinLst = receive_up_to({Fd, Port}, size(Bin),
+                                                   fun (E,L) -> [E,L] end,
+                                                   []),
+                            Bin = list_to_binary(lists:reverse(BinLst)),
                             gen_tcp:close(Sock),
                             passed
                     end,
@@ -142,19 +147,45 @@ write_server_client_variations() ->
                 fun (_Sock, _FdPort) -> passed end)
       end).
 
-receive_up_to(Fd, Port, N) ->
-    ok = hstcp_drv:recv(N, Fd, Port),
-    receive_up_to(Fd, Port, N, []).
+write_server_client_one_big() ->
+    Bin = <<-1:524288/native-unsigned>>,
+    Lst = lists:duplicate(16384, Bin),
+    Size = iolist_size(Lst), %% == 1GB
+    MD5 = erlang:md5(Lst),
+    twice(
+      fun () ->
+              with_connection(
+                fun (Sock, {Fd, Port}) ->
+                        ok = hstcp_drv:write(Fd, Port, Lst),
+                        Context =
+                            receive_up_to(Sock, Size,
+                                          fun (Bin1, Ctx) ->
+                                                  erlang:md5_update(Ctx, Bin1)
+                                          end,
+                                          erlang:md5_init()),
+                        MD5 = erlang:md5_final(Context),
+                        gen_tcp:close(Sock),
+                        passed
+                end,
+                fun (_Sock, _FdPort) -> passed end)
+      end).
 
-receive_up_to(_Fd, _Port, 0, Lst) ->
-    list_to_binary(lists:reverse(Lst));
-receive_up_to(Fd, Port, N, Lst) when N > 0 ->
+receive_up_to(_FdPortSock, 0, _Comb, Init) ->
+    Init;
+receive_up_to({Fd, Port}, N, Comb, Init) when N > 0 ->
     receive
         {hstcp_event, Port, {data, Fd, Data}} ->
-            receive_up_to(Fd, Port, N - size(Data), [Data|Lst]);
+            receive_up_to({Fd, Port}, N - size(Data), Comb, Comb(Data, Init));
         {hstcp_event, Port, Event} ->
             {error, Event}
-    end.
+    end;
+receive_up_to(Sock, N, Comb, Init) ->
+    Amount = case N > 65536 of
+                 true  -> 65536;
+                 false -> N
+             end,
+    {ok, Data} = gen_tcp:recv(Sock, Amount),
+    receive_up_to(Sock, N - size(Data), Comb, Comb(Data, Init)).
 
 acceptor(Parent, Fd, Port) ->
     fun () ->
@@ -187,21 +218,6 @@ with_connection(Connected, Closed) ->
 twice(Fun) ->
     passed = Fun(),
     passed = Fun().
-
-test_write2(IpPort) ->
-    {ok, Port} = hstcp_drv:start(),
-    {ok, Fd} = hstcp_drv:listen("0.0.0.0", IpPort, Port),
-    Bin = <<-1:524288/native-unsigned>>,
-    Lst = lists:duplicate(16384, Bin),
-    {ok, Fd} = hstcp_drv:accept(Fd, Port),
-    receive
-        {hstcp_event, Port, {ok, Fd1}} ->
-            hstcp_drv:write(Fd1, Port, Lst),
-            timer:sleep(10000),
-            {closed, Fd1} = hstcp_drv:close(Fd1, Port),
-            {closed, Fd} = hstcp_drv:close(Fd, Port),
-            ok = hstcp_drv:stop(Port)
-    end.
 
 test_write3(IpPort) ->
     {ok, Port} = hstcp_drv:start(),
