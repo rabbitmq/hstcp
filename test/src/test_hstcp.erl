@@ -30,7 +30,8 @@ test() ->
                            write_client_server(),
                            write_server_client(),
                            write_server_client_variations(),
-                           write_server_client_one_big()
+                           write_server_client_one_big(),
+                           write_server_client_streaming()
                 ]).
 
 start_stop() ->
@@ -170,6 +171,45 @@ write_server_client_one_big() ->
                 fun (_Sock, _FdPort) -> passed end)
       end).
 
+write_server_client_streaming() ->
+    %% The point here is to continue to send data through to the
+    %% driver as the driver is still writing data out of the
+    %% socket. This stresses the driver's command queue between the
+    %% driver thread, and the libev thread.
+    Count = 65536,
+    Bin = <<-1:1024/native-unsigned>>,
+    Lst = lists:duplicate(128, Bin),
+    twice(
+      fun () ->
+              with_connection(
+                fun (Sock, {Fd, Port}) ->
+                        spawn(fun () -> repeat_write(Fd, Port, Lst, Count) end),
+                        BytesRecv = Count * iolist_size(Lst),
+                        Context =
+                            receive_up_to(Sock, BytesRecv,
+                                          fun (Bin1, Ctx) ->
+                                                  erlang:md5_update(Ctx, Bin1)
+                                          end,
+                                          erlang:md5_init()),
+                        MD5 = erlang:md5_final(Context),
+                        MD5 = erlang:md5_final(
+                                lists:foldl(fun (_, Ctx) ->
+                                                    erlang:md5_update(Ctx, Lst)
+                                            end, erlang:md5_init(),
+                                            lists:duplicate(Count, ok))),
+                        gen_tcp:close(Sock),
+                        passed
+                end,
+                fun (_Sock, _FdPort) -> passed end
+               )
+      end).
+
+repeat_write(_Fd, _Port, _List, 0) ->
+    ok;
+repeat_write(Fd, Port, List, N) when N > 0 ->
+    ok = hstcp_drv:write(Fd, Port, List),
+    repeat_write(Fd, Port, List, N - 1).
+
 receive_up_to(_FdPortSock, 0, _Comb, Init) ->
     Init;
 receive_up_to({Fd, Port}, N, Comb, Init) when N > 0 ->
@@ -219,29 +259,7 @@ twice(Fun) ->
     passed = Fun(),
     passed = Fun().
 
-test_write3(IpPort) ->
-    {ok, Port} = hstcp_drv:start(),
-    {ok, Fd} = hstcp_drv:listen("0.0.0.0", IpPort, Port),
-    Bin = <<-1:8192/native-unsigned>>,
-    Lst = lists:duplicate(128, Bin),
-    {ok, Fd} = hstcp_drv:accept(Fd, Port),
-    receive
-        {hstcp_event, Port, {ok, Fd1}} ->
-            tw3(Port, Fd1, Lst, 65536),
-            timer:sleep(10000),
-            {closed, Fd1} = hstcp_drv:close(Fd1, Port),
-            {closed, Fd} = hstcp_drv:close(Fd, Port),
-            ok = hstcp_drv:stop(Port)
-    end.
-tw3(_Port, _Fd, _List, 0) ->
-    ok;
-tw3(Port, Fd, List, N) ->
-    hstcp_drv:write(Fd, Port, List),
-    tw3(Port, Fd, List, N-1).
-
-spawn_test(IpPort) ->
-    spawn(fun () -> test(IpPort) end).
-
+%% This is just a general speed receiving test
 test(IpPort) ->
     {ok, Port} = hstcp_drv:start(),
     {ok, Fd} = hstcp_drv:listen("0.0.0.0", IpPort, Port),
