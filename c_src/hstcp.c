@@ -53,6 +53,7 @@
 #define SOCKET_ERROR_SPEC_LEN  15
 #define OK_FD_SPEC_LEN         12
 #define FD_DATA_SPEC_LEN       16
+#define FD_SMALL_DATA_SPEC_LEN 15
 #define FD_CLOSED_SPEC_LEN     12
 #define FD_BAD_SPEC_LEN        12
 
@@ -70,28 +71,31 @@ typedef struct {
   ErlDrvPort     port;               /* driver port                                    */
   ErlDrvTermData pid;                /* driver pid                                     */
 
-  /* {'hstcp_event', Port, 'no_such_command'}                                            */
+  /* {'hstcp_event', Port, 'no_such_command'}                                          */
   ErlDrvTermData *no_such_command_atom_spec;
 
-  /* {'hstcp_event', Port, 'ok'}                                                         */
+  /* {'hstcp_event', Port, 'ok'}                                                       */
   ErlDrvTermData *ok_atom_spec;
 
-  /* {'hstcp_event', Port, {'reader_error', "string"}}                                   */
+  /* {'hstcp_event', Port, {'reader_error', "string}                                   */
   ErlDrvTermData *reader_error_spec; /* terms for errors from reader                   */
 
-  /* {'hstcp_event', Port, {'socket_error', Fd, "string"}}                               */
+  /* {'hstcp_event', Port, {'socket_error', Fd, "string"}}                             */
   ErlDrvTermData *socket_error_spec; /* terms for errors from socket                   */
 
-  /* {'hstcp_event', Port, {'ok', Fd}}                                                   */
+  /* {'hstcp_event', Port, {'ok', Fd}}                                                 */
   ErlDrvTermData *ok_fd_spec;        /* terms for ok results including a fd            */
 
-  /* {'hstcp_event', Port, {'data', Fd, Binary}}                                         */
+  /* {'hstcp_event', Port, {'data', Fd, Binary}}                                       */
   ErlDrvTermData *fd_data_spec;      /* terms for results including a fd and data      */
 
-  /* {'hstcp_event', Port, {'closed', Fd}}                                               */
+  /* {'hstcp_event', Port, {'data', Fd, Binary}}                                       */
+  ErlDrvTermData *fd_small_data_spec;/* terms for results including a fd and data      */
+
+  /* {'hstcp_event', Port, {'closed', Fd}}                                             */
   ErlDrvTermData *fd_closed_spec;    /* terms for sending to a pid on socket close     */
 
-  /* {'hstcp_event', Port, {'badarg', Fd}}                                               */
+  /* {'hstcp_event', Port, {'badarg', Fd}}                                             */
   ErlDrvTermData *fd_bad_spec;       /* terms for sending to a pid on general error    */
 
   struct ev_loop *epoller;           /* our ev loop                                    */
@@ -1452,6 +1456,28 @@ static ErlDrvData hstcp_start(const ErlDrvPort port, char *const buff) {
   sd->fd_data_spec[14] = ERL_DRV_TUPLE;
   sd->fd_data_spec[15] = 3;
 
+  sd->fd_small_data_spec = (ErlDrvTermData*)
+    driver_alloc(FD_SMALL_DATA_SPEC_LEN * sizeof(ErlDrvTermData));
+
+  if (NULL == sd->fd_small_data_spec)
+    return ERL_DRV_ERROR_GENERAL;
+
+  sd->fd_small_data_spec[0] = ERL_DRV_ATOM;
+  sd->fd_small_data_spec[1] = driver_mk_atom("hstcp_event");
+  sd->fd_small_data_spec[2] = ERL_DRV_PORT;
+  sd->fd_small_data_spec[3] = driver_mk_port(port);
+  sd->fd_small_data_spec[4] = ERL_DRV_ATOM;
+  sd->fd_small_data_spec[5] = driver_mk_atom("data");
+  sd->fd_small_data_spec[6] = ERL_DRV_INT;
+  sd->fd_small_data_spec[7] = (ErlDrvSInt)0;
+  sd->fd_small_data_spec[8] = ERL_DRV_BUF2BINARY;
+  sd->fd_small_data_spec[9] = (ErlDrvTermData)NULL;
+  sd->fd_small_data_spec[10] = (ErlDrvUInt)0;
+  sd->fd_small_data_spec[11] = ERL_DRV_TUPLE;
+  sd->fd_small_data_spec[12] = 3;
+  sd->fd_small_data_spec[13] = ERL_DRV_TUPLE;
+  sd->fd_small_data_spec[14] = 3;
+
   sd->fd_closed_spec = (ErlDrvTermData*)
     driver_alloc(FD_CLOSED_SPEC_LEN * sizeof(ErlDrvTermData));
 
@@ -1553,6 +1579,7 @@ static void hstcp_stop(const ErlDrvData drv_data) {
   driver_free((char*)sd->socket_error_spec);
   driver_free((char*)sd->ok_fd_spec);
   driver_free((char*)sd->fd_data_spec);
+  driver_free((char*)sd->fd_small_data_spec);
   driver_free((char*)sd->fd_closed_spec);
   driver_free((char*)sd->fd_bad_spec);
   driver_free((char*)sd->async_watcher);
