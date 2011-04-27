@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -60,6 +61,10 @@
 
 #define WRITE_COMMAND_PREFIX_LENGTH 9
 #define DEFAULT_IOV_MAX 16
+
+#ifndef SOL_TCP
+# define SOL_TCP IPPROTO_TCP
+#endif
 
 typedef struct {
   ErlDrvPort     port;               /* driver port                                    */
@@ -423,6 +428,18 @@ int setnonblock(const int fd) { /* and turn off nagle */
   return fcntl(fd, F_SETFL, flags);
 }
 
+int setreuse(const int fd) {
+  const int reuse = 1;
+  /* turn on reuseaddr */
+  return setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+}
+
+int setnodelay(const int fd) {
+  const int nodelay = 1;
+  /* turn on nodelay */
+  return setsockopt(fd, SOL_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+}
+
 void socket_listen(HstcpData *const sd, Reader *const reader) {
   const char *address = NULL;
   const uint64_t *address_len = NULL;
@@ -470,6 +487,24 @@ void socket_listen(HstcpData *const sd, Reader *const reader) {
     return;
   }
 
+  /* turn on reuseaddr */
+  if (0 > setreuse(listen_fd)) {
+    return_socket_error_pid(sd, 0, errno, sd->pid);
+    return;
+  }
+
+  /* turn on nodelay */
+  if (0 > setnodelay(listen_fd)) {
+    return_socket_error_pid(sd, 0, errno, sd->pid);
+    return;
+  }
+
+  /* put socket into nonblocking mode - needed for libev */
+  if (0 > setnonblock(listen_fd)) {
+    return_socket_error_pid(sd, 0, errno, sd->pid);
+    return;
+  }
+
   if (0 > bind(listen_fd,
                (struct sockaddr *)&listen_address,
                sizeof(listen_address))) {
@@ -479,23 +514,6 @@ void socket_listen(HstcpData *const sd, Reader *const reader) {
 
   /* listen for incoming connections. set backlog to 128 */
   if (0 > listen(listen_fd, 128)) {
-    return_socket_error_pid(sd, 0, errno, sd->pid);
-    return;
-  }
-
-  const int reuse = 1;
-  /* turn on reuseaddr */
-  if (0 > setsockopt(listen_fd,
-                     SOL_SOCKET,
-                     SO_REUSEADDR,
-                     &reuse,
-                     sizeof(reuse))) {
-    return_socket_error_pid(sd, 0, errno, sd->pid);
-    return;
-  }
-
-  /* put socket into nonblocking mode - needed for libev */
-  if (0 > setnonblock(listen_fd)) {
     return_socket_error_pid(sd, 0, errno, sd->pid);
     return;
   }
@@ -958,6 +976,17 @@ static void hstcp_ev_listen_cb(EV_P_ ev_io *w, int revents) {
       const int accepted_fd =
         accept(fd, (struct sockaddr *)&client_addr, &client_len);
 
+      if (0 > setreuse(accepted_fd)) {
+        perror("Cannot set reuse on socket\r\n");
+        driver_failure(sd->port, -1);
+      }
+
+      if (0 > setnodelay(accepted_fd)) {
+        perror("Cannot set nodelay on socket\r\n");
+        driver_failure(sd->port, -1);
+        return;
+      }
+
       if (0 > setnonblock(accepted_fd)) {
         perror("Cannot set socket non-blocking\r\n");
         driver_failure(sd->port, -1);
@@ -1042,7 +1071,6 @@ static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
              fd when we do the */
           se = *se_ptr;
           erl_drv_mutex_unlock(sd->sockets_mutex);
-
           if (socket_entry_destroy(se, sd)) {
             if (0 > close(fd))
               return_socket_error_pid(sd, fd, errno, se->pid);
