@@ -28,7 +28,8 @@ test() ->
                            start_listen_accept_connect_close_close_stop_1(),
                            start_listen_accept_connect_close_close_stop_2(),
                            write_client_server(),
-                           write_server_client()
+                           write_server_client(),
+                           write_server_client_variations()
                 ]).
 
 start_stop() ->
@@ -99,6 +100,48 @@ write_server_client() ->
                     fun (_Sock, _FdPort) -> passed end)
           end).
 
+write_server_client_variations() ->
+    %% The point here is to test the various ways in which binaries
+    %% can get passed to the driver.
+    BigBin1 = <<-1:4096/native-unsigned>>,
+    BigBin2 = <<1:4096/native-unsigned>>,
+    SmallBin = <<10:8/native-unsigned>>,
+
+    ToSend = [SmallBin,
+              [SmallBin],
+              BigBin1,
+              [BigBin1],
+              [SmallBin, BigBin1],
+              [BigBin1, SmallBin],
+              [SmallBin, BigBin1, BigBin2],
+              [BigBin1, SmallBin, BigBin2],
+              [BigBin1, BigBin2, SmallBin],
+              [SmallBin, SmallBin],
+              [BigBin1, BigBin1],
+              [lists:duplicate(2000, BigBin1), BigBin2]],
+    MD5 = erlang:md5(ToSend),
+    twice(
+      fun () ->
+              with_connection(
+                fun (Sock, {Fd, Port}) ->
+                        [ok = hstcp_drv:write(Fd, Port, Bin)
+                         || Bin <- ToSend],
+                        MD5 = erlang:md5_final(
+                                lists:foldl(
+                                  fun (Bin, Context) ->
+                                          Size = iolist_size(Bin),
+                                          %% Bin1 will always be a
+                                          %% plain binary, and not the
+                                          %% iolist that was written.
+                                          {ok, Bin1} = gen_tcp:recv(Sock, Size),
+                                          erlang:md5_update(Context, Bin1)
+                                  end, erlang:md5_init(), ToSend)),
+                        gen_tcp:close(Sock),
+                        passed
+                end,
+                fun (_Sock, _FdPort) -> passed end)
+      end).
+
 receive_up_to(Fd, Port, N) ->
     ok = hstcp_drv:recv(N, Fd, Port),
     receive_up_to(Fd, Port, N, []).
@@ -144,47 +187,6 @@ with_connection(Connected, Closed) ->
 twice(Fun) ->
     passed = Fun(),
     passed = Fun().
-
-
-test_write(IpPort) ->
-    {ok, Port} = hstcp_drv:start(),
-    {ok, Fd} = hstcp_drv:listen("0.0.0.0", IpPort, Port),
-    BigBin1 = <<-1:4096/native-unsigned>>,
-    BigBin2 = <<1:4096/native-unsigned>>,
-    SmallBin = <<10:8/native-unsigned>>,
-    {ok, Fd} = hstcp_drv:accept(Fd, Port),
-    receive
-        {hstcp_event, Port, {ok, Fd1}} ->
-            io:format("small bin raw~n"),
-            hstcp_drv:write(Fd1, Port, SmallBin),
-            io:format("small bin list~n"),
-            hstcp_drv:write(Fd1, Port, [SmallBin]),
-            io:format("big bin raw~n"),
-            hstcp_drv:write(Fd1, Port, BigBin1),
-            io:format("big bin list~n"),
-            hstcp_drv:write(Fd1, Port, [BigBin1]),
-            io:format("small big~n"),
-            hstcp_drv:write(Fd1, Port, [SmallBin, BigBin1]),
-            io:format("big small~n"),
-            hstcp_drv:write(Fd1, Port, [BigBin1, SmallBin]),
-            io:format("small big1 big2~n"),
-            hstcp_drv:write(Fd1, Port, [SmallBin, BigBin1, BigBin2]),
-            io:format("big1 small big2~n"),
-            hstcp_drv:write(Fd1, Port, [BigBin1, SmallBin, BigBin2]),
-            io:format("big1 big2 small~n"),
-            hstcp_drv:write(Fd1, Port, [BigBin1, BigBin2, SmallBin]),
-            io:format("small small~n"),
-            hstcp_drv:write(Fd1, Port, [SmallBin, SmallBin]),
-            io:format("big big~n"),
-            hstcp_drv:write(Fd1, Port, [BigBin1, BigBin1]),
-            io:format("massive~n"),
-            hstcp_drv:write(Fd1, Port, [lists:duplicate(2000, BigBin1), BigBin2]),
-            io:format("done~n"),
-            timer:sleep(5000),
-            {closed, Fd1} = hstcp_drv:close(Fd1, Port),
-            {closed, Fd} = hstcp_drv:close(Fd, Port),
-            ok = hstcp_drv:stop(Port)
-    end.
 
 test_write2(IpPort) ->
     {ok, Port} = hstcp_drv:start(),
