@@ -48,14 +48,11 @@
 #define OK                     1
 #define READER_ERROR          -1
 
-#define ATOM_SPEC_LEN          8
-#define READER_ERROR_SPEC_LEN  13
-#define SOCKET_ERROR_SPEC_LEN  15
-#define OK_FD_SPEC_LEN         12
-#define FD_DATA_SPEC_LEN       16
-#define FD_SMALL_DATA_SPEC_LEN 15
-#define FD_CLOSED_SPEC_LEN     12
-#define FD_BAD_SPEC_LEN        12
+#define ATOM_SPEC_LEN          12
+#define STRING_ERROR_SPEC_LEN  17
+#define NEW_FD_SPEC_LEN        20
+#define DATA_SPEC_LEN          18
+#define SMALL_DATA_SPEC_LEN    17
 
 #define LISTEN_SOCKET 1
 #define CONNECTED_SOCKET 2
@@ -74,32 +71,32 @@ typedef struct {
   ErlDrvPort     port;               /* driver port                                    */
   ErlDrvTermData pid;                /* driver pid                                     */
 
-  /* {'hstcp_event', Port, 'no_such_command'}                                          */
-  ErlDrvTermData *no_such_command_atom_spec;
+  /* {'hstcp_event', {Port, Fd}, 'no_such_command'}                                    */
+  ErlDrvTermData *no_such_command_spec;
 
-  /* {'hstcp_event', Port, 'ok'}                                                       */
-  ErlDrvTermData *ok_atom_spec;
+  /* {'hstcp_event', {Port, Fd}, 'ok'}                                                 */
+  ErlDrvTermData *ok_spec;
 
-  /* {'hstcp_event', Port, {'reader_error', "string}                                   */
+  /* {'hstcp_event', {Port, Fd}, {'reader_error', "string"}}                           */
   ErlDrvTermData *reader_error_spec; /* terms for errors from reader                   */
 
-  /* {'hstcp_event', Port, {'socket_error', Fd, "string"}}                             */
+  /* {'hstcp_event', {Port, Fd}, {'socket_error', "string"}}                           */
   ErlDrvTermData *socket_error_spec; /* terms for errors from socket                   */
 
-  /* {'hstcp_event', Port, {'ok', Fd}}                                                 */
-  ErlDrvTermData *ok_fd_spec;        /* terms for ok results including a fd            */
+  /* {'hstcp_event', {Port, Fd}, {'new_fd', {Port, Fd}}}                               */
+  ErlDrvTermData *new_fd_spec;       /* terms for ok results including a fd            */
 
-  /* {'hstcp_event', Port, {'data', Fd, Binary}}                                       */
-  ErlDrvTermData *fd_data_spec;      /* terms for results including a fd and data      */
+  /* {'hstcp_event', {Port, Fd}, {'data', Binary}}                                     */
+  ErlDrvTermData *data_spec;         /* terms for results including a fd and data      */
 
-  /* {'hstcp_event', Port, {'data', Fd, Binary}}                                       */
-  ErlDrvTermData *fd_small_data_spec;/* terms for results including a fd and data      */
+  /* {'hstcp_event', {Port, Fd}, {'data', Binary}}                                     */
+  ErlDrvTermData *small_data_spec;   /* terms for results including a fd and data      */
 
-  /* {'hstcp_event', Port, {'closed', Fd}}                                             */
-  ErlDrvTermData *fd_closed_spec;    /* terms for sending to a pid on socket close     */
+  /* {'hstcp_event', {Port, Fd} 'closed'}}                                             */
+  ErlDrvTermData *closed_spec;       /* terms for sending to a pid on socket close     */
 
-  /* {'hstcp_event', Port, {'badarg', Fd}}                                             */
-  ErlDrvTermData *fd_bad_spec;       /* terms for sending to a pid on general error    */
+  /* {'hstcp_event', {Port, Fd}, 'badarg'}                                             */
+  ErlDrvTermData *badarg_spec;       /* terms for sending to a pid on general error    */
 
   struct ev_loop *epoller;           /* our ev loop                                    */
   ErlDrvTid      tid;                /* the thread running our ev loop                 */
@@ -274,11 +271,11 @@ void return_reader_error(HstcpData *const sd, const Reader *const reader) {
       error_str = "Unknown error";
     }
   }
-  sd->reader_error_spec[7] = (ErlDrvTermData)error_str;
-  sd->reader_error_spec[8] = (ErlDrvUInt)strlen(error_str);
-  driver_send_term(sd->port, sd->pid, sd->reader_error_spec, READER_ERROR_SPEC_LEN);
-  sd->reader_error_spec[7] = (ErlDrvTermData)NULL;
-  sd->reader_error_spec[8] = 0;
+  sd->reader_error_spec[11] = (ErlDrvTermData)error_str;
+  sd->reader_error_spec[12] = (ErlDrvUInt)strlen(error_str);
+  driver_send_term(sd->port, sd->pid, sd->reader_error_spec, STRING_ERROR_SPEC_LEN);
+  sd->reader_error_spec[11] = (ErlDrvTermData)NULL;
+  sd->reader_error_spec[12] = 0;
 }
 
 
@@ -389,27 +386,27 @@ void command_dequeue(SocketAction **sa, HstcpData *const sd) {
 
 void return_socket_closed_pid(HstcpData *const sd, const int fd,
                               ErlDrvTermData pid) {
-  sd->fd_closed_spec[7] = (ErlDrvSInt)fd;
-  driver_send_term(sd->port, pid, sd->fd_closed_spec, FD_CLOSED_SPEC_LEN);
-  sd->fd_closed_spec[7] = 0;
+  sd->closed_spec[5] = (ErlDrvSInt)fd;
+  driver_send_term(sd->port, pid, sd->closed_spec, ATOM_SPEC_LEN);
+  sd->closed_spec[5] = 0;
 }
 
-void return_socket_bad_pid(HstcpData *const sd, const int fd,
+void return_badarg_pid(HstcpData *const sd, const int fd,
                            ErlDrvTermData pid) {
-  sd->fd_bad_spec[7] = (ErlDrvSInt)fd;
-  driver_send_term(sd->port, pid, sd->fd_bad_spec, FD_BAD_SPEC_LEN);
-  sd->fd_bad_spec[7] = 0;
+  sd->badarg_spec[5] = (ErlDrvSInt)fd;
+  driver_send_term(sd->port, pid, sd->badarg_spec, ATOM_SPEC_LEN);
+  sd->badarg_spec[5] = 0;
 }
 
 void return_socket_error_str_pid(HstcpData *const sd, const int fd,
                                  const char* error_str, ErlDrvTermData pid) {
-  sd->socket_error_spec[7] = (ErlDrvSInt)fd;
-  sd->socket_error_spec[9] = (ErlDrvTermData)error_str;
-  sd->socket_error_spec[10] = (ErlDrvUInt)strlen(error_str);
-  driver_send_term(sd->port, pid, sd->socket_error_spec, SOCKET_ERROR_SPEC_LEN);
-  sd->socket_error_spec[7] = (ErlDrvSInt)0;
-  sd->socket_error_spec[9] = (ErlDrvTermData)NULL;
-  sd->socket_error_spec[10] = 0;
+  sd->socket_error_spec[5] = (ErlDrvSInt)fd;
+  sd->socket_error_spec[11] = (ErlDrvTermData)error_str;
+  sd->socket_error_spec[12] = (ErlDrvUInt)strlen(error_str);
+  driver_send_term(sd->port, pid, sd->socket_error_spec, STRING_ERROR_SPEC_LEN);
+  sd->socket_error_spec[5] = (ErlDrvSInt)0;
+  sd->socket_error_spec[11] = (ErlDrvTermData)NULL;
+  sd->socket_error_spec[12] = 0;
 }
 
 void return_socket_error_pid(HstcpData *const sd, const int fd, const int error,
@@ -417,10 +414,19 @@ void return_socket_error_pid(HstcpData *const sd, const int fd, const int error,
   return_socket_error_str_pid(sd, fd, strerror(error), pid);
 }
 
-void return_ok_fd_pid(HstcpData *const sd, ErlDrvTermData pid, const int fd) {
-  sd->ok_fd_spec[7] = fd;
-  driver_send_term(sd->port, pid, sd->ok_fd_spec, OK_FD_SPEC_LEN);
-  sd->ok_fd_spec[7] = 0;
+void return_ok_pid(HstcpData *const sd, ErlDrvTermData pid, const int fd) {
+  sd->ok_spec[5] = fd;
+  driver_send_term(sd->port, pid, sd->ok_spec, ATOM_SPEC_LEN);
+  sd->ok_spec[5] = 0;
+}
+
+void return_new_fd(HstcpData *const sd, ErlDrvTermData pid,
+                   const int old_fd, const int new_fd) {
+  sd->new_fd_spec[5] = old_fd;
+  sd->new_fd_spec[13] = new_fd;
+  driver_send_term(sd->port, pid, sd->new_fd_spec, NEW_FD_SPEC_LEN);
+  sd->new_fd_spec[5] = 0;
+  sd->new_fd_spec[13] = 0;
 }
 
 
@@ -982,13 +988,13 @@ static void hstcp_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
           return;
         }
 
-        sd->fd_data_spec[7] = fd;
-        sd->fd_data_spec[9] = (ErlDrvTermData)binary;
-        sd->fd_data_spec[10] = (ErlDrvUInt)achieved;
-        driver_send_term(sd->port, pid, sd->fd_data_spec, FD_DATA_SPEC_LEN);
-        sd->fd_data_spec[7] = 0;
-        sd->fd_data_spec[9] = (ErlDrvTermData)NULL;
-        sd->fd_data_spec[10] = (ErlDrvUInt)0;
+        sd->data_spec[5] = fd;
+        sd->data_spec[11] = (ErlDrvTermData)binary;
+        sd->data_spec[12] = (ErlDrvUInt)achieved;
+        driver_send_term(sd->port, pid, sd->data_spec, DATA_SPEC_LEN);
+        sd->data_spec[5] = 0;
+        sd->data_spec[11] = (ErlDrvTermData)NULL;
+        sd->data_spec[12] = (ErlDrvUInt)0;
         driver_free_binary(binary);
 
       } else {
@@ -999,14 +1005,14 @@ static void hstcp_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
 
         achieved = recv(fd, buf, requested, 0);
 
-        sd->fd_small_data_spec[7] = fd;
-        sd->fd_small_data_spec[9] = (ErlDrvTermData)buf;
-        sd->fd_small_data_spec[10] = (ErlDrvUInt)achieved;
-        driver_send_term(sd->port, pid, sd->fd_small_data_spec,
-                         FD_SMALL_DATA_SPEC_LEN);
-        sd->fd_small_data_spec[7] = 0;
-        sd->fd_small_data_spec[9] = (ErlDrvTermData)NULL;
-        sd->fd_small_data_spec[10] = (ErlDrvUInt)0;
+        sd->small_data_spec[5] = fd;
+        sd->small_data_spec[11] = (ErlDrvTermData)buf;
+        sd->small_data_spec[12] = (ErlDrvUInt)achieved;
+        driver_send_term(sd->port, pid, sd->small_data_spec,
+                         SMALL_DATA_SPEC_LEN);
+        sd->small_data_spec[5] = 0;
+        sd->small_data_spec[11] = (ErlDrvTermData)NULL;
+        sd->small_data_spec[12] = (ErlDrvUInt)0;
         driver_free(buf);
       }
 
@@ -1072,9 +1078,7 @@ static void hstcp_ev_listen_cb(EV_P_ ev_io *w, int revents) {
         driver_failure(sd->port, -1);
       }
 
-      sd->ok_fd_spec[7] = accepted_fd;
-      driver_send_term(sd->port, pid, sd->ok_fd_spec, OK_FD_SPEC_LEN);
-      sd->ok_fd_spec[7] = 0;
+      return_new_fd(sd, pid, fd, accepted_fd);
 
       /* figure out if there are more pending acceptors */
       pid_ptr = NULL;
@@ -1108,7 +1112,7 @@ static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
 
     case HSTCP_ASYNC_START:
       mark_done_and_signal(sa);
-      driver_send_term(sd->port, sa->pid, sd->ok_atom_spec, ATOM_SPEC_LEN);
+      driver_send_term(sd->port, sa->pid, sd->ok_spec, ATOM_SPEC_LEN);
       break;
 
     case HSTCP_ASYNC_EXIT:
@@ -1135,7 +1139,7 @@ static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
           *se_ptr = connected_socket_create(fd, pid, sd);
         erl_drv_mutex_unlock(sd->sockets_mutex);
 
-        return_ok_fd_pid(sd, pid, fd);
+        return_new_fd(sd, pid, 0, fd);
         break;
       }
 
@@ -1167,7 +1171,7 @@ static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
 
         } else {
           erl_drv_mutex_unlock(sd->sockets_mutex);
-          return_socket_bad_pid(sd, fd, pid); /* programmer messed up */
+          return_badarg_pid(sd, fd, pid); /* programmer messed up */
         }
         break;
       }
@@ -1211,11 +1215,11 @@ static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
           if (0 == index) /* if we're the first acceptor, enable the
                              watcher */
             ev_io_start(sd->epoller, se->watcher);
-          return_ok_fd_pid(sd, pid, fd);
+          return_ok_pid(sd, pid, fd);
 
         } else {
           erl_drv_mutex_unlock(sd->sockets_mutex);
-          return_socket_bad_pid(sd, fd, pid); /* programmer messed up */
+          return_badarg_pid(sd, fd, pid); /* programmer messed up */
         }
         break;
       }
@@ -1245,7 +1249,7 @@ static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
           }
         } else {
           erl_drv_mutex_unlock(sd->sockets_mutex);
-          return_socket_bad_pid(sd, fd, pid); /* programmer messed up */
+          return_badarg_pid(sd, fd, pid); /* programmer messed up */
         }
         break;
       }
@@ -1413,6 +1417,25 @@ static int hstcp_init() {
   return 0;
 }
 
+int prepare_spec(const ErlDrvPort port, ErlDrvTermData **spec, const int len) {
+  *spec = (ErlDrvTermData*)driver_alloc(len * sizeof(ErlDrvTermData));
+  if (NULL == *spec)
+    return FALSE;
+
+  (*spec)[0] = ERL_DRV_ATOM;
+  (*spec)[1] = driver_mk_atom("hstcp_event");
+  (*spec)[2] = ERL_DRV_PORT;
+  (*spec)[3] = driver_mk_port(port);
+  (*spec)[4] = ERL_DRV_INT;
+  (*spec)[5] = (ErlDrvSInt)0;
+  (*spec)[6] = ERL_DRV_TUPLE;
+  (*spec)[7] = 2;
+  (*spec)[len-2] = ERL_DRV_TUPLE;
+  (*spec)[len-1] = 3;
+
+  return TRUE;
+}
+
 static ErlDrvData hstcp_start(const ErlDrvPort port, char *const buff) {
   HstcpData *const sd = (HstcpData*)driver_alloc(sizeof(HstcpData));
 
@@ -1422,179 +1445,79 @@ static ErlDrvData hstcp_start(const ErlDrvPort port, char *const buff) {
   sd->port = port;
   sd->pid = driver_caller(port);
 
-  sd->no_such_command_atom_spec =
-    (ErlDrvTermData*)driver_alloc(ATOM_SPEC_LEN * sizeof(ErlDrvTermData));
-
-  if (NULL == sd->no_such_command_atom_spec)
+  if (! prepare_spec(port, &(sd->no_such_command_spec), ATOM_SPEC_LEN))
     return ERL_DRV_ERROR_GENERAL;
+  sd->no_such_command_spec[8] = ERL_DRV_ATOM;
+  sd->no_such_command_spec[9] = driver_mk_atom("no_such_command");
 
-  sd->no_such_command_atom_spec[0] = ERL_DRV_ATOM;
-  sd->no_such_command_atom_spec[1] = driver_mk_atom("hstcp_event");
-  sd->no_such_command_atom_spec[2] = ERL_DRV_PORT;
-  sd->no_such_command_atom_spec[3] = driver_mk_port(port);
-  sd->no_such_command_atom_spec[4] = ERL_DRV_ATOM;
-  sd->no_such_command_atom_spec[5] = driver_mk_atom("no_such_command");
-  sd->no_such_command_atom_spec[6] = ERL_DRV_TUPLE;
-  sd->no_such_command_atom_spec[7] = 3;
-
-  sd->ok_atom_spec =
-    (ErlDrvTermData*)driver_alloc(ATOM_SPEC_LEN * sizeof(ErlDrvTermData));
-
-  if (NULL == sd->ok_atom_spec)
+  if (! prepare_spec(port, &(sd->ok_spec), ATOM_SPEC_LEN))
     return ERL_DRV_ERROR_GENERAL;
+  sd->ok_spec[8] = ERL_DRV_ATOM;
+  sd->ok_spec[9] = driver_mk_atom("ok");
 
-  sd->ok_atom_spec[0] = ERL_DRV_ATOM;
-  sd->ok_atom_spec[1] = driver_mk_atom("hstcp_event");
-  sd->ok_atom_spec[2] = ERL_DRV_PORT;
-  sd->ok_atom_spec[3] = driver_mk_port(port);
-  sd->ok_atom_spec[4] = ERL_DRV_ATOM;
-  sd->ok_atom_spec[5] = driver_mk_atom("ok");
-  sd->ok_atom_spec[6] = ERL_DRV_TUPLE;
-  sd->ok_atom_spec[7] = 3;
-
-  sd->reader_error_spec = (ErlDrvTermData*)
-    driver_alloc(READER_ERROR_SPEC_LEN * sizeof(ErlDrvTermData));
-
-  if (NULL == sd->reader_error_spec)
+  if (! prepare_spec(port, &(sd->reader_error_spec), STRING_ERROR_SPEC_LEN))
     return ERL_DRV_ERROR_GENERAL;
+  sd->reader_error_spec[8] = ERL_DRV_ATOM;
+  sd->reader_error_spec[9] = driver_mk_atom("reader_error");
+  sd->reader_error_spec[10] = ERL_DRV_STRING;
+  sd->reader_error_spec[11] = (ErlDrvTermData)NULL;
+  sd->reader_error_spec[12] = 0;
+  sd->reader_error_spec[13] = ERL_DRV_TUPLE;
+  sd->reader_error_spec[14] = 2;
 
-  sd->reader_error_spec[0] = ERL_DRV_ATOM;
-  sd->reader_error_spec[1] = driver_mk_atom("hstcp_event");
-  sd->reader_error_spec[2] = ERL_DRV_PORT;
-  sd->reader_error_spec[3] = driver_mk_port(port);
-  sd->reader_error_spec[4] = ERL_DRV_ATOM;
-  sd->reader_error_spec[5] = driver_mk_atom("reader_error");
-  sd->reader_error_spec[6] = ERL_DRV_STRING;
-  sd->reader_error_spec[7] = (ErlDrvTermData)NULL;
-  sd->reader_error_spec[8] = 0;
-  sd->reader_error_spec[9] = ERL_DRV_TUPLE;
-  sd->reader_error_spec[10] = 2;
-  sd->reader_error_spec[11] = ERL_DRV_TUPLE;
-  sd->reader_error_spec[12] = 3;
-
-  sd->socket_error_spec = (ErlDrvTermData*)
-    driver_alloc(SOCKET_ERROR_SPEC_LEN * sizeof(ErlDrvTermData));
-
-  if (NULL == sd->socket_error_spec)
+  if (! prepare_spec(port, &(sd->socket_error_spec), STRING_ERROR_SPEC_LEN))
     return ERL_DRV_ERROR_GENERAL;
-
-  sd->socket_error_spec[0] = ERL_DRV_ATOM;
-  sd->socket_error_spec[1] = driver_mk_atom("hstcp_event");
-  sd->socket_error_spec[2] = ERL_DRV_PORT;
-  sd->socket_error_spec[3] = driver_mk_port(port);
-  sd->socket_error_spec[4] = ERL_DRV_ATOM;
-  sd->socket_error_spec[5] = driver_mk_atom("socket_error");
-  sd->socket_error_spec[6] = ERL_DRV_INT;
-  sd->socket_error_spec[7] = (ErlDrvSInt)0;
-  sd->socket_error_spec[8] = ERL_DRV_STRING;
-  sd->socket_error_spec[9] = (ErlDrvTermData)NULL;
-  sd->socket_error_spec[10] = 0;
-  sd->socket_error_spec[11] = ERL_DRV_TUPLE;
-  sd->socket_error_spec[12] = 3;
+  sd->socket_error_spec[8] = ERL_DRV_ATOM;
+  sd->socket_error_spec[9] = driver_mk_atom("socket_error");
+  sd->socket_error_spec[10] = ERL_DRV_STRING;
+  sd->socket_error_spec[11] = (ErlDrvTermData)NULL;
+  sd->socket_error_spec[12] = 0;
   sd->socket_error_spec[13] = ERL_DRV_TUPLE;
-  sd->socket_error_spec[14] = 3;
+  sd->socket_error_spec[14] = 2;
 
-  sd->ok_fd_spec = (ErlDrvTermData*)
-    driver_alloc(OK_FD_SPEC_LEN * sizeof(ErlDrvTermData));
-
-  if (NULL == sd->ok_fd_spec)
+  if (! prepare_spec(port, &(sd->new_fd_spec), NEW_FD_SPEC_LEN))
     return ERL_DRV_ERROR_GENERAL;
+  sd->new_fd_spec[8] = ERL_DRV_ATOM;
+  sd->new_fd_spec[9] = driver_mk_atom("new_fd");
+  sd->new_fd_spec[10] = ERL_DRV_PORT;
+  sd->new_fd_spec[11] = driver_mk_port(port);
+  sd->new_fd_spec[12] = ERL_DRV_INT;
+  sd->new_fd_spec[13] = (ErlDrvSInt)0;
+  sd->new_fd_spec[14] = ERL_DRV_TUPLE;
+  sd->new_fd_spec[15] = 2;
+  sd->new_fd_spec[16] = ERL_DRV_TUPLE;
+  sd->new_fd_spec[17] = 2;
 
-  sd->ok_fd_spec[0] = ERL_DRV_ATOM;
-  sd->ok_fd_spec[1] = driver_mk_atom("hstcp_event");
-  sd->ok_fd_spec[2] = ERL_DRV_PORT;
-  sd->ok_fd_spec[3] = driver_mk_port(port);
-  sd->ok_fd_spec[4] = ERL_DRV_ATOM;
-  sd->ok_fd_spec[5] = driver_mk_atom("ok");
-  sd->ok_fd_spec[6] = ERL_DRV_INT;
-  sd->ok_fd_spec[7] = (ErlDrvSInt)0;
-  sd->ok_fd_spec[8] = ERL_DRV_TUPLE;
-  sd->ok_fd_spec[9] = 2;
-  sd->ok_fd_spec[10] = ERL_DRV_TUPLE;
-  sd->ok_fd_spec[11] = 3;
-
-  sd->fd_data_spec = (ErlDrvTermData*)
-    driver_alloc(FD_DATA_SPEC_LEN * sizeof(ErlDrvTermData));
-
-  if (NULL == sd->fd_data_spec)
+  if (! prepare_spec(port, &(sd->data_spec), DATA_SPEC_LEN))
     return ERL_DRV_ERROR_GENERAL;
+  sd->data_spec[8] = ERL_DRV_ATOM;
+  sd->data_spec[9] = driver_mk_atom("data");
+  sd->data_spec[10] = ERL_DRV_BINARY;
+  sd->data_spec[11] = (ErlDrvTermData)NULL;
+  sd->data_spec[12] = (ErlDrvUInt)0;
+  sd->data_spec[13] = (ErlDrvUInt)0;
+  sd->data_spec[14] = ERL_DRV_TUPLE;
+  sd->data_spec[15] = 2;
 
-  sd->fd_data_spec[0] = ERL_DRV_ATOM;
-  sd->fd_data_spec[1] = driver_mk_atom("hstcp_event");
-  sd->fd_data_spec[2] = ERL_DRV_PORT;
-  sd->fd_data_spec[3] = driver_mk_port(port);
-  sd->fd_data_spec[4] = ERL_DRV_ATOM;
-  sd->fd_data_spec[5] = driver_mk_atom("data");
-  sd->fd_data_spec[6] = ERL_DRV_INT;
-  sd->fd_data_spec[7] = (ErlDrvSInt)0;
-  sd->fd_data_spec[8] = ERL_DRV_BINARY;
-  sd->fd_data_spec[9] = (ErlDrvTermData)NULL;
-  sd->fd_data_spec[10] = (ErlDrvUInt)0;
-  sd->fd_data_spec[11] = (ErlDrvUInt)0;
-  sd->fd_data_spec[12] = ERL_DRV_TUPLE;
-  sd->fd_data_spec[13] = 3;
-  sd->fd_data_spec[14] = ERL_DRV_TUPLE;
-  sd->fd_data_spec[15] = 3;
-
-  sd->fd_small_data_spec = (ErlDrvTermData*)
-    driver_alloc(FD_SMALL_DATA_SPEC_LEN * sizeof(ErlDrvTermData));
-
-  if (NULL == sd->fd_small_data_spec)
+  if (! prepare_spec(port, &(sd->small_data_spec), SMALL_DATA_SPEC_LEN))
     return ERL_DRV_ERROR_GENERAL;
+  sd->small_data_spec[8] = ERL_DRV_ATOM;
+  sd->small_data_spec[9] = driver_mk_atom("data");
+  sd->small_data_spec[10] = ERL_DRV_BUF2BINARY;
+  sd->small_data_spec[11] = (ErlDrvTermData)NULL;
+  sd->small_data_spec[12] = (ErlDrvUInt)0;
+  sd->small_data_spec[13] = ERL_DRV_TUPLE;
+  sd->small_data_spec[14] = 2;
 
-  sd->fd_small_data_spec[0] = ERL_DRV_ATOM;
-  sd->fd_small_data_spec[1] = driver_mk_atom("hstcp_event");
-  sd->fd_small_data_spec[2] = ERL_DRV_PORT;
-  sd->fd_small_data_spec[3] = driver_mk_port(port);
-  sd->fd_small_data_spec[4] = ERL_DRV_ATOM;
-  sd->fd_small_data_spec[5] = driver_mk_atom("data");
-  sd->fd_small_data_spec[6] = ERL_DRV_INT;
-  sd->fd_small_data_spec[7] = (ErlDrvSInt)0;
-  sd->fd_small_data_spec[8] = ERL_DRV_BUF2BINARY;
-  sd->fd_small_data_spec[9] = (ErlDrvTermData)NULL;
-  sd->fd_small_data_spec[10] = (ErlDrvUInt)0;
-  sd->fd_small_data_spec[11] = ERL_DRV_TUPLE;
-  sd->fd_small_data_spec[12] = 3;
-  sd->fd_small_data_spec[13] = ERL_DRV_TUPLE;
-  sd->fd_small_data_spec[14] = 3;
-
-  sd->fd_closed_spec = (ErlDrvTermData*)
-    driver_alloc(FD_CLOSED_SPEC_LEN * sizeof(ErlDrvTermData));
-
-  if (NULL == sd->fd_closed_spec)
+  if (! prepare_spec(port, &(sd->closed_spec), ATOM_SPEC_LEN))
     return ERL_DRV_ERROR_GENERAL;
+  sd->closed_spec[8] = ERL_DRV_ATOM;
+  sd->closed_spec[9] = driver_mk_atom("closed");
 
-  sd->fd_closed_spec[0] = ERL_DRV_ATOM;
-  sd->fd_closed_spec[1] = driver_mk_atom("hstcp_event");
-  sd->fd_closed_spec[2] = ERL_DRV_PORT;
-  sd->fd_closed_spec[3] = driver_mk_port(port);
-  sd->fd_closed_spec[4] = ERL_DRV_ATOM;
-  sd->fd_closed_spec[5] = driver_mk_atom("closed");
-  sd->fd_closed_spec[6] = ERL_DRV_INT;
-  sd->fd_closed_spec[7] = (ErlDrvSInt)0;
-  sd->fd_closed_spec[8] = ERL_DRV_TUPLE;
-  sd->fd_closed_spec[9] = 2;
-  sd->fd_closed_spec[10] = ERL_DRV_TUPLE;
-  sd->fd_closed_spec[11] = 3;
-
-  sd->fd_bad_spec = (ErlDrvTermData*)
-    driver_alloc(FD_BAD_SPEC_LEN * sizeof(ErlDrvTermData));
-
-  if (NULL == sd->fd_bad_spec)
+  if (! prepare_spec(port, &(sd->badarg_spec), ATOM_SPEC_LEN))
     return ERL_DRV_ERROR_GENERAL;
-
-  sd->fd_bad_spec[0] = ERL_DRV_ATOM;
-  sd->fd_bad_spec[1] = driver_mk_atom("hstcp_event");
-  sd->fd_bad_spec[2] = ERL_DRV_PORT;
-  sd->fd_bad_spec[3] = driver_mk_port(port);
-  sd->fd_bad_spec[4] = ERL_DRV_ATOM;
-  sd->fd_bad_spec[5] = driver_mk_atom("badarg");
-  sd->fd_bad_spec[6] = ERL_DRV_INT;
-  sd->fd_bad_spec[7] = (ErlDrvSInt)0;
-  sd->fd_bad_spec[8] = ERL_DRV_TUPLE;
-  sd->fd_bad_spec[9] = 2;
-  sd->fd_bad_spec[10] = ERL_DRV_TUPLE;
-  sd->fd_bad_spec[11] = 3;
+  sd->badarg_spec[8] = ERL_DRV_ATOM;
+  sd->badarg_spec[9] = driver_mk_atom("badarg");
 
   /* Note that startup here is a bit surprising: we don't want to
      create the epoller in this thread because if we do then we'll
@@ -1653,15 +1576,15 @@ static void hstcp_stop(const ErlDrvData drv_data) {
   command_enqueue_and_notify(sa, sd);
   erl_drv_thread_join(sd->tid, NULL);
 
-  driver_free((char*)sd->no_such_command_atom_spec);
-  driver_free((char*)sd->ok_atom_spec);
+  driver_free((char*)sd->no_such_command_spec);
+  driver_free((char*)sd->ok_spec);
   driver_free((char*)sd->reader_error_spec);
   driver_free((char*)sd->socket_error_spec);
-  driver_free((char*)sd->ok_fd_spec);
-  driver_free((char*)sd->fd_data_spec);
-  driver_free((char*)sd->fd_small_data_spec);
-  driver_free((char*)sd->fd_closed_spec);
-  driver_free((char*)sd->fd_bad_spec);
+  driver_free((char*)sd->new_fd_spec);
+  driver_free((char*)sd->data_spec);
+  driver_free((char*)sd->small_data_spec);
+  driver_free((char*)sd->closed_spec);
+  driver_free((char*)sd->badarg_spec);
   driver_free((char*)sd->async_watcher);
 
   erl_drv_mutex_destroy(sd->command_mutex);
@@ -1711,7 +1634,7 @@ static void hstcp_outputv(ErlDrvData drv_data, ErlIOVec *const ev) {
       break;
 
     default:
-      spec = sd->no_such_command_atom_spec;
+      spec = sd->no_such_command_spec;
     }
   } else {
     return_reader_error(sd, &reader);

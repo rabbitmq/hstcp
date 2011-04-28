@@ -16,8 +16,8 @@
 
 -module(hstcp_drv).
 
--export([start/0, stop/1, listen/3, connect/3, close/2, accept/2,
-         recv/3, write/3]).
+-export([start/0, stop/1, listen/3, connect/3, close/1, accept/1,
+         recv/2, write/2]).
 
 -define(LIBNAME, "libhstcp").
 
@@ -39,42 +39,45 @@ start() ->
     Port = open_port({spawn_driver, ?LIBNAME}, [binary, stream]),
     %% The reply here actually comes up from the ev loop thread, and
     %% is worth waiting for.
-    {simple_reply(Port), Port}.
+    {simple_reply(Port, 0), {Port, 0}}.
 
-stop(Port) ->
+stop({Port, 0}) ->
     true = port_close(Port),
     ok.
 
-listen(Port, IpAddress, IpPort) ->
+listen({Port, 0}, IpAddress, IpPort) ->
     socket(?HSTCP_LISTEN, Port, IpAddress, IpPort).
 
-connect(Port, IpAddress, IpPort) ->
+connect({Port, 0}, IpAddress, IpPort) ->
     socket(?HSTCP_CONNECT, Port, IpAddress, IpPort).
 
-close(Port, Fd) ->
+close({Port, Fd}) when Fd > 0 ->
     true = port_command(Port, <<?HSTCP_CLOSE, Fd:64/native-signed>>),
-    simple_reply(Port).
+    simple_reply(Port, Fd).
 
-accept(Port, Fd) ->
+accept({Port, Fd}) when Fd > 0 ->
     true = port_command(Port, <<?HSTCP_ACCEPT, Fd:64/native-signed>>),
-    simple_reply(Port).
+    simple_reply(Port, Fd).
 
-recv(Port, Fd, all) ->
+recv({Port, Fd}, all) when Fd > 0 ->
     recv1(Port, Fd, -2);
-recv(Port, Fd, once) ->
+recv({Port, Fd}, once) when Fd > 0 ->
     recv1(Port, Fd, -1);
-recv(Port, Fd, Bytes) when Bytes >= 0 ->
+recv({Port, Fd}, Bytes) when Fd > 0 andalso Bytes >= 0 ->
     recv1(Port, Fd, Bytes).
 
-write(Port, Fd, Data) ->
+write({Port, Fd}, Data) when Fd > 0 ->
     true = port_command(
              Port, [<<?HSTCP_WRITE, Fd:64/native-signed>>, Data]),
     ok.
 
 %% ---------------------------------------------------------------------------
 
-simple_reply(Port) ->
-    receive {hstcp_event, Port, Result} -> Result end.
+simple_reply(Port, Fd) ->
+    receive
+        {hstcp_event, {Port, Fd1}, Result} when Fd1 =:= Fd orelse Fd1 =:= 0 ->
+            Result
+    end.
 
 address_str({A,B,C,D}) ->
     tl(lists:flatten([[$., integer_to_list(X)] || X <- [A,B,C,D]]));
@@ -86,7 +89,7 @@ socket(Action, Port, IpAddress, IpPort) ->
     true = port_command(
              Port, <<Action, (length(AddressStr)):64/native,
                      (list_to_binary(AddressStr))/binary, IpPort:16/native>>),
-    simple_reply(Port).
+    simple_reply(Port, 0).
 
 recv1(Port, Fd, N) ->
     true = port_command(
