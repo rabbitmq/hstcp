@@ -23,10 +23,11 @@
 enum _CommandType {
   HSTCP_INVALID_COMMAND = 255,
   HSTCP_LISTEN          = 0,
-  HSTCP_CLOSE           = 1,
-  HSTCP_ACCEPT          = 2,
-  HSTCP_RECV            = 3,
-  HSTCP_WRITE           = 4
+  HSTCP_CONNECT         = 1,
+  HSTCP_CLOSE           = 2,
+  HSTCP_ACCEPT          = 3,
+  HSTCP_RECV            = 4,
+  HSTCP_WRITE           = 5
 };
 typedef enum _CommandType CommandType;
 
@@ -40,7 +41,7 @@ typedef enum _ReaderError ReaderError;
 enum _AsyncCommandType {
   HSTCP_ASYNC_START            = 0,
   HSTCP_ASYNC_EXIT             = 1,
-  HSTCP_ASYNC_LISTEN           = 2,
+  HSTCP_ASYNC_SOCKET           = 2,
   HSTCP_ASYNC_CLOSE            = 3,
   HSTCP_ASYNC_ACCEPT           = 4,
   HSTCP_ASYNC_RECV             = 5,

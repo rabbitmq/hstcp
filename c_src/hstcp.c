@@ -152,7 +152,7 @@ typedef struct {
   uint8_t        done;
   uint8_t        free_when_done;
   int64_t        value;
-  HstcpData        *sd;
+  HstcpData      *sd;
   ErlIOVec       *ev;
   ErlDrvCond     *cond;
   ErlDrvMutex    *mutex;
@@ -447,22 +447,103 @@ int setnodelay(const int fd) {
   return setsockopt(fd, SOL_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 }
 
+int read_address_and_port(HstcpData *const sd, Reader *const reader,
+                          const char **const address,
+                          const uint64_t **const address_len,
+                          const uint16_t **const port) {
+  if (! read_binary(reader, address, address_len)) {
+    return_reader_error(sd, reader);
+    return FALSE;
+  }
+
+  if (! read_uint16(reader, port)) {
+    return_reader_error(sd, reader);
+    return FALSE;
+  }
+  return TRUE;
+}
+
+char *terminate_string(HstcpData *const sd, const char *src,
+                       const uint64_t len) {
+  /* strings coming from Erlang are not zero terminated, and the
+     length won't include the 0 stop byte, so copy into a new array,
+     ensuring we have a stop byte at the end. */
+  char *const dest = (char*) driver_alloc(len+1);
+  if (NULL == dest)
+    driver_failure(sd->port, -1);
+
+  dest[len] = '\0';
+  return strncpy(dest, src, len);
+}
+
+int prepare_address(HstcpData *const sd, struct sockaddr_in *const address,
+                    char *const address_str, const uint16_t port) {
+  memset(address, 0, sizeof(*address));
+
+  address->sin_family = AF_INET;
+  address->sin_port = htons(port);
+  const int inet_aton_res = inet_aton(address_str, &(address->sin_addr));
+  driver_free(address_str);
+
+  if (0 == inet_aton_res) { /* why does inet_aton return 0 on FAILURE?! */
+    return_socket_error_pid(sd, 0, errno, sd->pid);
+    return FALSE;
+  }
+  return TRUE;
+}
+
+void socket_connect(HstcpData *const sd, Reader *const reader) {
+  const char *address = NULL;
+  const uint64_t *address_len = NULL;
+  const uint16_t *port;
+
+  if (! read_address_and_port(sd, reader, &address, &address_len, &port))
+    return;
+
+  const int connect_fd = socket(AF_INET, SOCK_STREAM, 0);
+
+  if (connect_fd < 0) {
+    return_socket_error_pid(sd, 0, errno, sd->pid);
+    return;
+  }
+
+  char *const address_null = terminate_string(sd, address, *address_len);
+
+  struct sockaddr_in connect_address;
+  if (! prepare_address(sd, &connect_address, address_null, *port))
+    return;
+
+  if (0 > connect(connect_fd,
+                  (struct sockaddr *)&connect_address,
+                  sizeof(connect_address))) {
+    return_socket_error_pid(sd, 0, errno, sd->pid);
+    return;
+  }
+
+  if (0 > setnodelay(connect_fd)) {
+    return_socket_error_pid(sd, 0, errno, sd->pid);
+    return;
+  }
+
+  if (0 > setnonblock(connect_fd)) {
+    return_socket_error_pid(sd, 0, errno, sd->pid);
+    return;
+  }
+
+  SocketAction *sa = socket_action_alloc(HSTCP_ASYNC_SOCKET, connect_fd,
+                                         NULL, NULL, sd->pid, sd);
+  sa->value = CONNECTED_SOCKET;
+  command_enqueue_and_notify(sa, sd);
+}
+
 void socket_listen(HstcpData *const sd, Reader *const reader) {
   const char *address = NULL;
   const uint64_t *address_len = NULL;
-
-  if (! read_binary(reader, &address, &address_len)) {
-    return_reader_error(sd, reader);
-    return;
-  }
-
   const uint16_t *port;
-  if (! read_uint16(reader, &port)) {
-    return_reader_error(sd, reader);
-    return;
-  }
 
-  struct sockaddr_in listen_address;
+  if (! read_address_and_port(sd, reader, &address, &address_len, &port))
+    return;
+
   const int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 
   if (listen_fd < 0) {
@@ -470,44 +551,13 @@ void socket_listen(HstcpData *const sd, Reader *const reader) {
     return;
   }
 
-  /* strings coming from Erlang are not zero terminated, and the
-     length won't include the 0 stop byte, so copy into a new array,
-     ensuring we have a stop byte at the end. */
-  char *const address_null = (char*) driver_alloc((*address_len)+1);
-  if (NULL == address_null) {
-    return_reader_error(sd, reader);
+  char *const address_null = terminate_string(sd, address, *address_len);
+
+  struct sockaddr_in listen_address;
+  if (! prepare_address(sd, &listen_address, address_null, *port))
     return;
-  }
 
-  address_null[(*address_len)] = '\0';
-  strncpy(address_null, address, *address_len);
-
-  memset(&listen_address, 0, sizeof(listen_address));
-
-  listen_address.sin_family = AF_INET;
-  listen_address.sin_port = htons(*port);
-  const int inet_aton_res = inet_aton(address_null, &(listen_address.sin_addr));
-  driver_free(address_null);
-
-  if (0 == inet_aton_res) { /* why does inet_aton return 0 on FAILURE?! */
-    return_socket_error_pid(sd, 0, errno, sd->pid);
-    return;
-  }
-
-  /* turn on reuseaddr */
   if (0 > setreuse(listen_fd)) {
-    return_socket_error_pid(sd, 0, errno, sd->pid);
-    return;
-  }
-
-  /* turn on nodelay */
-  if (0 > setnodelay(listen_fd)) {
-    return_socket_error_pid(sd, 0, errno, sd->pid);
-    return;
-  }
-
-  /* put socket into nonblocking mode - needed for libev */
-  if (0 > setnonblock(listen_fd)) {
     return_socket_error_pid(sd, 0, errno, sd->pid);
     return;
   }
@@ -519,14 +569,24 @@ void socket_listen(HstcpData *const sd, Reader *const reader) {
     return;
   }
 
-  /* listen for incoming connections. set backlog to 128 */
   if (0 > listen(listen_fd, 128)) {
     return_socket_error_pid(sd, 0, errno, sd->pid);
     return;
   }
 
-  SocketAction *sa = socket_action_alloc(HSTCP_ASYNC_LISTEN, listen_fd,
+  if (0 > setnodelay(listen_fd)) {
+    return_socket_error_pid(sd, 0, errno, sd->pid);
+    return;
+  }
+
+  if (0 > setnonblock(listen_fd)) {
+    return_socket_error_pid(sd, 0, errno, sd->pid);
+    return;
+  }
+
+  SocketAction *sa = socket_action_alloc(HSTCP_ASYNC_SOCKET, listen_fd,
                                          NULL, NULL, sd->pid, sd);
+  sa->value = LISTEN_SOCKET;
   command_enqueue_and_notify(sa, sd);
 }
 
@@ -1001,11 +1061,6 @@ static void hstcp_ev_listen_cb(EV_P_ ev_io *w, int revents) {
       const int accepted_fd =
         accept(fd, (struct sockaddr *)&client_addr, &client_len);
 
-      if (0 > setreuse(accepted_fd)) {
-        perror("Cannot set reuse on socket\r\n");
-        driver_failure(sd->port, -1);
-      }
-
       if (0 > setnodelay(accepted_fd)) {
         perror("Cannot set nodelay on socket\r\n");
         driver_failure(sd->port, -1);
@@ -1063,17 +1118,21 @@ static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
       ev_loop_destroy(EV_A);
       break;
 
-    case HSTCP_ASYNC_LISTEN:
+    case HSTCP_ASYNC_SOCKET:
       {
         /* The main driver thread has done the open, so if we've got
            this far, we know the socket was opened successfully */
         const int fd = sa->fd;
         const ErlDrvTermData pid = sa->pid;
+        const uint64_t value = sa->value;
         mark_done_and_signal(sa);
         erl_drv_mutex_lock(sd->sockets_mutex);
         SocketEntry **se_ptr = NULL;
         JLI(se_ptr, sd->sockets, fd);
-        *se_ptr = listen_socket_create(fd, pid, sd);
+        if (LISTEN_SOCKET == value)
+          *se_ptr = listen_socket_create(fd, pid, sd);
+        else
+          *se_ptr = connected_socket_create(fd, pid, sd);
         erl_drv_mutex_unlock(sd->sockets_mutex);
 
         return_ok_fd_pid(sd, pid, fd);
@@ -1629,6 +1688,10 @@ static void hstcp_outputv(ErlDrvData drv_data, ErlIOVec *const ev) {
 
     case HSTCP_LISTEN:
       socket_listen(sd, &reader);
+      break;
+
+    case HSTCP_CONNECT:
+      socket_connect(sd, &reader);
       break;
 
     case HSTCP_CLOSE:

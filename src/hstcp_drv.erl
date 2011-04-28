@@ -16,15 +16,17 @@
 
 -module(hstcp_drv).
 
--export([start/0, stop/1, listen/3, close/2, accept/2, recv/3, write/3]).
+-export([start/0, stop/1, listen/3, connect/3, close/2, accept/2,
+         recv/3, write/3]).
 
 -define(LIBNAME, "libhstcp").
 
--define(HSTCP_LISTEN, 0). %% KEEP IN SYNC WITH HSTCP.H
--define(HSTCP_CLOSE,  1).
--define(HSTCP_ACCEPT, 2).
--define(HSTCP_RECV,   3).
--define(HSTCP_WRITE,  4).
+-define(HSTCP_LISTEN,   0). %% KEEP IN SYNC WITH HSTCP.H
+-define(HSTCP_CONNECT,  1).
+-define(HSTCP_CLOSE,    2).
+-define(HSTCP_ACCEPT,   3).
+-define(HSTCP_RECV,     4).
+-define(HSTCP_WRITE,    5).
 
 start() ->
     erl_ddll:start(),
@@ -44,9 +46,15 @@ stop(Port) ->
     ok.
 
 listen(IpAddress, IpPort, Port) ->
+    socket(?HSTCP_LISTEN, IpAddress, IpPort, Port).
+
+connect(IpAddress, IpPort, Port) ->
+    socket(?HSTCP_CONNECT, IpAddress, IpPort, Port).
+
+socket(Action, IpAddress, IpPort, Port) ->
     AddressStr = address_str(IpAddress),
     true = port_command(
-             Port, <<?HSTCP_LISTEN, (length(AddressStr)):64/native,
+             Port, <<Action, (length(AddressStr)):64/native,
                      (list_to_binary(AddressStr))/binary, IpPort:16/native>>),
     simple_reply(Port).
 
@@ -62,7 +70,7 @@ recv(all, Fd, Port) ->
     recv1(-2, Fd, Port);
 recv(once, Fd, Port) ->
     recv1(-1, Fd, Port);
-recv(Bytes, Fd, Port) ->
+recv(Bytes, Fd, Port) when Bytes >= 0 ->
     recv1(Bytes, Fd, Port).
 
 recv1(N, Fd, Port) ->
