@@ -67,6 +67,9 @@
 # define SOL_TCP IPPROTO_TCP
 #endif
 
+#define MIN(x,y) (x)<(y)?(x):(y)
+#define MAX(x,y) (x)>(y)?(x):(y)
+
 typedef struct {
   ErlDrvPort     port;               /* driver port                                    */
   ErlDrvTermData pid;                /* driver pid                                     */
@@ -901,33 +904,49 @@ static void hstcp_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
     } else {
       int64_t quota = se->socket.connected_socket.quota;
       int64_t requested = (0 <= quota && quota < bytes_ready) ? quota : bytes_ready;
+      requested = MIN(requested, SIZE_MAX);
       int64_t achieved = 0;
 
-      ErlDrvBinary *binary = driver_alloc_binary(requested);
-      if (NULL == binary)
-        driver_failure(sd->port, -1);
-
-      achieved = recv(fd, binary->orig_bytes, requested, 0);
-
-      if (0 > achieved) {
-        return_socket_error_pid(sd, fd, errno, pid);
-        return;
-      }
-
-      if (achieved < requested) {
-        binary = driver_realloc_binary(binary, achieved);
+      if (64 < requested) {
+        /* big binary */
+        ErlDrvBinary *binary = driver_alloc_binary(requested);
         if (NULL == binary)
           driver_failure(sd->port, -1);
-      }
 
-      sd->fd_data_spec[7] = fd;
-      sd->fd_data_spec[9] = (ErlDrvTermData)binary;
-      sd->fd_data_spec[10] = (ErlDrvUInt)achieved;
-      driver_send_term(sd->port, pid, sd->fd_data_spec, FD_DATA_SPEC_LEN);
-      sd->fd_data_spec[7] = 0;
-      sd->fd_data_spec[9] = (ErlDrvTermData)NULL;
-      sd->fd_data_spec[10] = (ErlDrvUInt)0;
-      driver_free_binary(binary);
+        achieved = recv(fd, binary->orig_bytes, requested, 0);
+
+        if (0 > achieved) {
+          return_socket_error_pid(sd, fd, errno, pid);
+          return;
+        }
+
+        sd->fd_data_spec[7] = fd;
+        sd->fd_data_spec[9] = (ErlDrvTermData)binary;
+        sd->fd_data_spec[10] = (ErlDrvUInt)achieved;
+        driver_send_term(sd->port, pid, sd->fd_data_spec, FD_DATA_SPEC_LEN);
+        sd->fd_data_spec[7] = 0;
+        sd->fd_data_spec[9] = (ErlDrvTermData)NULL;
+        sd->fd_data_spec[10] = (ErlDrvUInt)0;
+        driver_free_binary(binary);
+
+      } else {
+        /* little binary */
+        char *buf = driver_alloc(requested);
+        if (NULL == buf)
+          driver_failure(sd->port, -1);
+
+        achieved = recv(fd, buf, requested, 0);
+
+        sd->fd_small_data_spec[7] = fd;
+        sd->fd_small_data_spec[9] = (ErlDrvTermData)buf;
+        sd->fd_small_data_spec[10] = (ErlDrvUInt)achieved;
+        driver_send_term(sd->port, pid, sd->fd_small_data_spec,
+                         FD_SMALL_DATA_SPEC_LEN);
+        sd->fd_small_data_spec[7] = 0;
+        sd->fd_small_data_spec[9] = (ErlDrvTermData)NULL;
+        sd->fd_small_data_spec[10] = (ErlDrvUInt)0;
+        driver_free(buf);
+      }
 
       if (0 < quota) {
         if (achieved == quota)
