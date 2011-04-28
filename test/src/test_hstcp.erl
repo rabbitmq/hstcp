@@ -257,24 +257,36 @@ twice(Fun) ->
     passed = Fun(),
     passed = Fun().
 
-%% This is just a general speed receiving test
-test(IpPort) ->
+%% This is a general speed receiving test
+recv(IpPort) ->
+    receive_and_echo(IpPort, false).
+
+%% This is a general speed echo test
+echo(IpPort) ->
+    receive_and_echo(IpPort, true).
+
+receive_and_echo(IpPort, Echo) ->
     {ok, Port} = hstcp_drv:start(),
     {ok, Fd} = hstcp_drv:listen("0.0.0.0", IpPort, Port),
     {ok, Fd} = hstcp_drv:accept(Fd, Port),
     receive
         {hstcp_event, Port, {ok, Fd1}} ->
             ok = hstcp_drv:recv(once, Fd1, Port),
-            Result = drain(Fd1, Port, now(), 0, 0),
+            Result = drain(Echo, Fd1, Port, now(), 0, 0),
             {closed, Fd} = hstcp_drv:close(Fd, Port),
             ok = hstcp_drv:stop(Port),
             Result
     end.
-drain(Fd, Port, Start, Count, Size) ->
+
+drain(Echo, Fd, Port, Start, Count, Size) ->
     receive
         {hstcp_event, Port, {data, Fd, Data}} ->
             ok = hstcp_drv:recv(once, Fd, Port),
-            drain(Fd, Port, Start, Count+1, Size + size(Data));
+            case Echo of
+                true  -> ok = hstcp_drv:write(Fd, Port, Data);
+                false -> ok
+            end,
+            drain(Echo, Fd, Port, Start, Count+1, Size + size(Data));
         {hstcp_event, Port, Event} ->
             Elapsed = timer:now_diff(now(), Start),
             io:format("received ~p bytes, in ~p msgs, in ~p microseconds (~p bytes/sec)~n",
