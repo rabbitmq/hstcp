@@ -45,40 +45,28 @@ stop(Port) ->
     true = port_close(Port),
     ok.
 
-listen(IpAddress, IpPort, Port) ->
-    socket(?HSTCP_LISTEN, IpAddress, IpPort, Port).
+listen(Port, IpAddress, IpPort) ->
+    socket(?HSTCP_LISTEN, Port, IpAddress, IpPort).
 
-connect(IpAddress, IpPort, Port) ->
-    socket(?HSTCP_CONNECT, IpAddress, IpPort, Port).
+connect(Port, IpAddress, IpPort) ->
+    socket(?HSTCP_CONNECT, Port, IpAddress, IpPort).
 
-socket(Action, IpAddress, IpPort, Port) ->
-    AddressStr = address_str(IpAddress),
-    true = port_command(
-             Port, <<Action, (length(AddressStr)):64/native,
-                     (list_to_binary(AddressStr))/binary, IpPort:16/native>>),
-    simple_reply(Port).
-
-close(Fd, Port) ->
+close(Port, Fd) ->
     true = port_command(Port, <<?HSTCP_CLOSE, Fd:64/native-signed>>),
     simple_reply(Port).
 
-accept(Fd, Port) ->
+accept(Port, Fd) ->
     true = port_command(Port, <<?HSTCP_ACCEPT, Fd:64/native-signed>>),
     simple_reply(Port).
 
-recv(all, Fd, Port) ->
-    recv1(-2, Fd, Port);
-recv(once, Fd, Port) ->
-    recv1(-1, Fd, Port);
-recv(Bytes, Fd, Port) when Bytes >= 0 ->
-    recv1(Bytes, Fd, Port).
+recv(Port, Fd, all) ->
+    recv1(Port, Fd, -2);
+recv(Port, Fd, once) ->
+    recv1(Port, Fd, -1);
+recv(Port, Fd, Bytes) when Bytes >= 0 ->
+    recv1(Port, Fd, Bytes).
 
-recv1(N, Fd, Port) ->
-    true = port_command(
-             Port, <<?HSTCP_RECV, Fd:64/native-signed, N:64/native-signed>>),
-    ok.
-
-write(Fd, Port, Data) ->
+write(Port, Fd, Data) ->
     true = port_command(
              Port, [<<?HSTCP_WRITE, Fd:64/native-signed>>, Data]),
     ok.
@@ -92,3 +80,15 @@ address_str({A,B,C,D}) ->
     tl(lists:flatten([[$., integer_to_list(X)] || X <- [A,B,C,D]]));
 address_str(List) when is_list(List) ->
     List.
+
+socket(Action, Port, IpAddress, IpPort) ->
+    AddressStr = address_str(IpAddress),
+    true = port_command(
+             Port, <<Action, (length(AddressStr)):64/native,
+                     (list_to_binary(AddressStr))/binary, IpPort:16/native>>),
+    simple_reply(Port).
+
+recv1(Port, Fd, N) ->
+    true = port_command(
+             Port, <<?HSTCP_RECV, Fd:64/native-signed, N:64/native-signed>>),
+    ok.
