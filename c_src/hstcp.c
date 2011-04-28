@@ -670,7 +670,7 @@ void async_socket_write(SocketAction *const sa) {
             driver_failure(sd->port, -1);
         }
 
-        /* finally, patch up the first element of iov2 wrt written,
+        /* finally, patch up the first element of iov wrt written,
            which now holds the offset into the iov that we stopped
            in */
         ev_ptr->iov[0].iov_len  -= written;
