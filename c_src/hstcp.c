@@ -587,6 +587,7 @@ void async_socket_write(SocketAction *const sa) {
       erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
     } else {
       ErlIOVec *ev_ptr = se->socket.connected_socket.ev;
+      int err = 0;
       /* printf("before:\r\n"); */
       /* dump_ev(ev_ptr); */
 
@@ -594,9 +595,18 @@ void async_socket_write(SocketAction *const sa) {
       /* deliberate promotion from ssize_t to int64_t - matches ready */
       int64_t written =
         (int64_t)writev(fd, (const struct iovec *)ev_ptr->iov, iovcnt);
+      if (0 > written)
+        err = errno;
 
-      if (0 > written) {
-        return_socket_error_pid(sd, fd, errno, se->pid);
+      if (0 == written || EAGAIN == err || EWOULDBLOCK == err) {
+        erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
+
+        SocketAction *sa1 = socket_action_alloc(HSTCP_ASYNC_INCOMPLETE_WRITE, fd,
+                                                NULL, NULL, se->pid, sd);
+        command_enqueue_and_notify(sa1, sd);
+
+      } else if (0 > written) {
+        return_socket_error_pid(sd, fd, err, se->pid);
         erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
 
         close(fd);
@@ -616,14 +626,6 @@ void async_socket_write(SocketAction *const sa) {
         ev_ptr->vsize = 0;
         se->socket.connected_socket.pending_writes = 0;
         erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
-
-      } else if (0 == written) {
-        erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
-
-
-        SocketAction *sa1 = socket_action_alloc(HSTCP_ASYNC_INCOMPLETE_WRITE, fd,
-                                                NULL, NULL, se->pid, sd);
-        command_enqueue_and_notify(sa1, sd);
 
       } else {
         int64_t remaining = ready - written;
