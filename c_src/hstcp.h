@@ -27,7 +27,8 @@ enum _CommandType {
   HSTCP_CLOSE           = 2,
   HSTCP_ACCEPT          = 3,
   HSTCP_RECV            = 4,
-  HSTCP_WRITE           = 5
+  HSTCP_WRITE           = 5,
+  HSTCP_SET_OPTIONS     = 6
 };
 typedef enum _CommandType CommandType;
 

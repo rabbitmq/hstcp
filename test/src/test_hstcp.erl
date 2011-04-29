@@ -298,3 +298,44 @@ drain(Echo, Sock, Start, Count, Size) ->
         Other ->
             Other
     end.
+
+send(IpAddress, IpPort, Time) ->
+    {ok, Sock} = hstcp_drv:start(),
+    {new_fd, Sock1} = hstcp_drv:connect(Sock, IpAddress, IpPort),
+    %% set low at 1GB, high at 4GB
+    ok = hstcp_drv:set_options(Sock1, 1024*1024*1024, 1024*1024*4096),
+    TRef = timer:send_after(Time, stop),
+    Bin = <<1:8388608>>, %% 1MB
+    List = lists:duplicate(16, Bin), %% 16MB
+    Result = send1(Sock1, List, true),
+    closed = hstcp_drv:close(Sock1),
+    ok = hstcp_drv:stop(Sock),
+    timer:cancel(TRef),
+    receive stop -> ok after 0 -> ok end,
+    Result.
+
+send1(Sock, Payload, true) ->
+    ok = hstcp_drv:write(Sock, Payload),
+    receive
+        {hstcp_event, Sock, high_watermark} ->
+            io:format("stopping send~n"),
+            send1(Sock, Payload, false);
+        {hstcp_event, Sock, low_watermark} ->
+            send1(Sock, Payload, true);
+        {hstcp_event, Sock, Other} ->
+            Other;
+        stop -> ok
+    after 0 ->
+        send1(Sock, Payload, true)
+    end;
+send1(Sock, Payload, false) ->
+    receive
+        {hstcp_event, Sock, low_watermark} ->
+            io:format("starting send~n"),
+            send1(Sock, Payload, true);
+        {hstcp_event, Sock, high_watermark} ->
+            send1(Sock, Payload, false);
+        {hstcp_event, Sock, Other} ->
+            Other;
+        stop -> ok
+    end.

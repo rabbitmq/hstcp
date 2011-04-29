@@ -54,8 +54,11 @@
 #define DATA_SPEC_LEN          18
 #define SMALL_DATA_SPEC_LEN    17
 
-#define LISTEN_SOCKET 1
+#define LISTEN_SOCKET    1
 #define CONNECTED_SOCKET 2
+
+#define EVENT 1
+#define REPLY 2
 
 #define WRITE_COMMAND_PREFIX_LENGTH 9
 #define DEFAULT_IOV_MAX 16
@@ -71,13 +74,17 @@ typedef struct {
   ErlDrvPort     port;               /* driver port                                    */
   ErlDrvTermData pid;                /* driver pid                                     */
 
+  ErlDrvTermData event;              /* 'hstcp_event'                                  */
+  ErlDrvTermData reply;              /* 'hstcp_reply'                                  */
+  ErlDrvMutex    *send_term_mutex;   /* mutex for safely sending back to Erlang        */
+
   /* {'hstcp_event', {Port, Fd}, 'no_such_command'}                                    */
   ErlDrvTermData *no_such_command_spec;
 
   /* {'hstcp_event', {Port, Fd}, 'ok'}                                                 */
   ErlDrvTermData *ok_spec;
 
-  /* {'hstcp_event', {Port, Fd}, {'reader_error', "string"}}                           */
+  /* {'hstcp_reply', {Port, Fd}, {'reader_error', "string"}}                           */
   ErlDrvTermData *reader_error_spec; /* terms for errors from reader                   */
 
   /* {'hstcp_event', {Port, Fd}, {'socket_error', "string"}}                           */
@@ -97,6 +104,12 @@ typedef struct {
 
   /* {'hstcp_event', {Port, Fd}, 'badarg'}                                             */
   ErlDrvTermData *badarg_spec;       /* terms for sending to a pid on general error    */
+
+  /* {'hstcp_event', {Port, Fd}, 'low_watermark'}                                      */
+  ErlDrvTermData *low_watermark_spec;
+
+  /* {'hstcp_event', {Port, Fd}, 'high_watermark'}                                     */
+  ErlDrvTermData *high_watermark_spec;
 
   struct ev_loop *epoller;           /* our ev loop                                    */
   ErlDrvTid      tid;                /* the thread running our ev loop                 */
@@ -127,6 +140,8 @@ typedef struct {
   ErlDrvMutex *mutex;
   ErlIOVec *ev;
   ev_io *watcher;
+  int64_t low;
+  int64_t high;
 } ConnectedSocket;
 
 typedef union {
@@ -271,11 +286,13 @@ void return_reader_error(HstcpData *const sd, const Reader *const reader) {
       error_str = "Unknown error";
     }
   }
+  erl_drv_mutex_lock(sd->send_term_mutex);
   sd->reader_error_spec[11] = (ErlDrvTermData)error_str;
   sd->reader_error_spec[12] = (ErlDrvUInt)strlen(error_str);
   driver_send_term(sd->port, sd->pid, sd->reader_error_spec, STRING_ERROR_SPEC_LEN);
   sd->reader_error_spec[11] = (ErlDrvTermData)NULL;
   sd->reader_error_spec[12] = 0;
+  erl_drv_mutex_unlock(sd->send_term_mutex);
 }
 
 
@@ -384,22 +401,58 @@ void command_dequeue(SocketAction **sa, HstcpData *const sd) {
  *  Sending back to Erlang  *
  ****************************/
 
+void return_socket_low_watermark(HstcpData *const sd, const int fd,
+                                 ErlDrvTermData pid) {
+  erl_drv_mutex_lock(sd->send_term_mutex);
+  sd->low_watermark_spec[5] = (ErlDrvSInt)fd;
+  driver_send_term(sd->port, pid, sd->low_watermark_spec, ATOM_SPEC_LEN);
+  sd->low_watermark_spec[5] = 0;
+  erl_drv_mutex_unlock(sd->send_term_mutex);
+}
+
+void return_socket_high_watermark(HstcpData *const sd, const int fd,
+                                 ErlDrvTermData pid) {
+  erl_drv_mutex_lock(sd->send_term_mutex);
+  sd->high_watermark_spec[5] = (ErlDrvSInt)fd;
+  driver_send_term(sd->port, pid, sd->high_watermark_spec, ATOM_SPEC_LEN);
+  sd->high_watermark_spec[5] = 0;
+  erl_drv_mutex_unlock(sd->send_term_mutex);
+}
+
 void return_socket_closed_pid(HstcpData *const sd, const int fd,
-                              ErlDrvTermData pid) {
+                              ErlDrvTermData pid, const int type) {
+  erl_drv_mutex_lock(sd->send_term_mutex);
+  if (REPLY == type)
+    sd->closed_spec[1] = sd->reply;
+  else
+    sd->closed_spec[1] = sd->event;
   sd->closed_spec[5] = (ErlDrvSInt)fd;
   driver_send_term(sd->port, pid, sd->closed_spec, ATOM_SPEC_LEN);
   sd->closed_spec[5] = 0;
+  erl_drv_mutex_unlock(sd->send_term_mutex);
 }
 
 void return_badarg_pid(HstcpData *const sd, const int fd,
-                           ErlDrvTermData pid) {
+                       ErlDrvTermData pid, const int type) {
+  erl_drv_mutex_lock(sd->send_term_mutex);
+  if (REPLY == type)
+    sd->badarg_spec[1] = sd->reply;
+  else
+    sd->badarg_spec[1] = sd->event;
   sd->badarg_spec[5] = (ErlDrvSInt)fd;
   driver_send_term(sd->port, pid, sd->badarg_spec, ATOM_SPEC_LEN);
   sd->badarg_spec[5] = 0;
+  erl_drv_mutex_unlock(sd->send_term_mutex);
 }
 
-void return_socket_error_str_pid(HstcpData *const sd, const int fd,
-                                 const char* error_str, ErlDrvTermData pid) {
+void return_socket_error_pid(HstcpData *const sd, const int fd, const int error,
+                             ErlDrvTermData pid, const int type) {
+  const char* error_str = strerror(error);
+  erl_drv_mutex_lock(sd->send_term_mutex);
+  if (REPLY == type)
+    sd->socket_error_spec[1] = sd->reply;
+  else
+    sd->socket_error_spec[1] = sd->event;
   sd->socket_error_spec[5] = (ErlDrvSInt)fd;
   sd->socket_error_spec[11] = (ErlDrvTermData)error_str;
   sd->socket_error_spec[12] = (ErlDrvUInt)strlen(error_str);
@@ -407,26 +460,31 @@ void return_socket_error_str_pid(HstcpData *const sd, const int fd,
   sd->socket_error_spec[5] = (ErlDrvSInt)0;
   sd->socket_error_spec[11] = (ErlDrvTermData)NULL;
   sd->socket_error_spec[12] = 0;
+  erl_drv_mutex_unlock(sd->send_term_mutex);
 }
 
-void return_socket_error_pid(HstcpData *const sd, const int fd, const int error,
-                             ErlDrvTermData pid) {
-  return_socket_error_str_pid(sd, fd, strerror(error), pid);
-}
-
-void return_ok_pid(HstcpData *const sd, ErlDrvTermData pid, const int fd) {
+void return_ok_pid(HstcpData *const sd, const int fd,
+                   const ErlDrvTermData pid) {
+  erl_drv_mutex_lock(sd->send_term_mutex);
   sd->ok_spec[5] = fd;
   driver_send_term(sd->port, pid, sd->ok_spec, ATOM_SPEC_LEN);
   sd->ok_spec[5] = 0;
+  erl_drv_mutex_unlock(sd->send_term_mutex);
 }
 
 void return_new_fd(HstcpData *const sd, ErlDrvTermData pid,
-                   const int old_fd, const int new_fd) {
+                   const int old_fd, const int new_fd, const int type) {
+  erl_drv_mutex_lock(sd->send_term_mutex);
+  if (REPLY == type)
+    sd->new_fd_spec[1] = sd->reply;
+  else
+    sd->new_fd_spec[1] = sd->event;
   sd->new_fd_spec[5] = old_fd;
   sd->new_fd_spec[13] = new_fd;
   driver_send_term(sd->port, pid, sd->new_fd_spec, NEW_FD_SPEC_LEN);
   sd->new_fd_spec[5] = 0;
   sd->new_fd_spec[13] = 0;
+  erl_drv_mutex_unlock(sd->send_term_mutex);
 }
 
 
@@ -492,7 +550,7 @@ int prepare_address(HstcpData *const sd, struct sockaddr_in *const address,
   driver_free(address_str);
 
   if (0 == inet_aton_res) { /* why does inet_aton return 0 on FAILURE?! */
-    return_socket_error_pid(sd, 0, errno, sd->pid);
+    return_socket_error_pid(sd, 0, errno, sd->pid, REPLY);
     return FALSE;
   }
   return TRUE;
@@ -509,7 +567,7 @@ void socket_connect(HstcpData *const sd, Reader *const reader) {
   const int connect_fd = socket(AF_INET, SOCK_STREAM, 0);
 
   if (connect_fd < 0) {
-    return_socket_error_pid(sd, 0, errno, sd->pid);
+    return_socket_error_pid(sd, 0, errno, sd->pid, REPLY);
     return;
   }
 
@@ -522,17 +580,17 @@ void socket_connect(HstcpData *const sd, Reader *const reader) {
   if (0 > connect(connect_fd,
                   (struct sockaddr *)&connect_address,
                   sizeof(connect_address))) {
-    return_socket_error_pid(sd, 0, errno, sd->pid);
+    return_socket_error_pid(sd, 0, errno, sd->pid, REPLY);
     return;
   }
 
   if (0 > setnodelay(connect_fd)) {
-    return_socket_error_pid(sd, 0, errno, sd->pid);
+    return_socket_error_pid(sd, 0, errno, sd->pid, REPLY);
     return;
   }
 
   if (0 > setnonblock(connect_fd)) {
-    return_socket_error_pid(sd, 0, errno, sd->pid);
+    return_socket_error_pid(sd, 0, errno, sd->pid, REPLY);
     return;
   }
 
@@ -553,7 +611,7 @@ void socket_listen(HstcpData *const sd, Reader *const reader) {
   const int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 
   if (listen_fd < 0) {
-    return_socket_error_pid(sd, 0, errno, sd->pid);
+    return_socket_error_pid(sd, 0, errno, sd->pid, REPLY);
     return;
   }
 
@@ -564,29 +622,29 @@ void socket_listen(HstcpData *const sd, Reader *const reader) {
     return;
 
   if (0 > setreuse(listen_fd)) {
-    return_socket_error_pid(sd, 0, errno, sd->pid);
+    return_socket_error_pid(sd, 0, errno, sd->pid, REPLY);
     return;
   }
 
   if (0 > bind(listen_fd,
                (struct sockaddr *)&listen_address,
                sizeof(listen_address))) {
-    return_socket_error_pid(sd, 0, errno, sd->pid);
+    return_socket_error_pid(sd, 0, errno, sd->pid, REPLY);
     return;
   }
 
   if (0 > listen(listen_fd, 128)) {
-    return_socket_error_pid(sd, 0, errno, sd->pid);
+    return_socket_error_pid(sd, 0, errno, sd->pid, REPLY);
     return;
   }
 
   if (0 > setnodelay(listen_fd)) {
-    return_socket_error_pid(sd, 0, errno, sd->pid);
+    return_socket_error_pid(sd, 0, errno, sd->pid, REPLY);
     return;
   }
 
   if (0 > setnonblock(listen_fd)) {
-    return_socket_error_pid(sd, 0, errno, sd->pid);
+    return_socket_error_pid(sd, 0, errno, sd->pid, REPLY);
     return;
   }
 
@@ -664,6 +722,13 @@ void async_socket_write(SocketAction *const sa) {
       if (0 > written)
         err = errno;
 
+      if (0 < written &&
+          ready > se->socket.connected_socket.low &&
+          se->socket.connected_socket.low >= (ready - written)) {
+        /* we've written enough to fall below the low water mark*/
+        return_socket_low_watermark(sd, fd, se->pid);
+      }
+
       if (0 == written || EAGAIN == err || EWOULDBLOCK == err) {
         erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
 
@@ -672,7 +737,7 @@ void async_socket_write(SocketAction *const sa) {
         command_enqueue_and_notify(sa1, sd);
 
       } else if (0 > written) {
-        return_socket_error_pid(sd, fd, err, se->pid);
+        return_socket_error_pid(sd, fd, err, se->pid, EVENT);
         erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
 
         close(fd);
@@ -760,9 +825,13 @@ void async_socket_write(SocketAction *const sa) {
 void socket_write(HstcpData *const sd, Reader *const reader) {
   const int64_t *fd64_ptr = NULL;
   if (! read_int64(reader, &fd64_ptr)) {
-    /* write is async so just drop this silently! */
+    return_badarg_pid(sd, *fd64_ptr, sd->pid, REPLY);
     return;
   }
+  return_ok_pid(sd, *fd64_ptr, sd->pid);
+  /* any errors that occur from here on are probably fatal to the
+     socket and thus will be sent to the socket owning process */
+
   /* we need to block the emulator thread until the libev thread has
      copied out the contents of the ErlIOVec ev. Thus we allocate on
      the stack, and use the mutex and cond. */
@@ -775,6 +844,32 @@ void socket_write(HstcpData *const sd, Reader *const reader) {
   await_done(&sa);
 }
 
+void socket_set_options(HstcpData *const sd, Reader *const reader) {
+  const ErlDrvTermData pid = sd->pid;
+  const int64_t *fd64_ptr = NULL;
+  const int64_t *low_ptr = NULL;
+  const int64_t *high_ptr = NULL;
+  if (! (read_int64(reader, &fd64_ptr) &&
+         read_int64(reader, &low_ptr) &&
+         read_int64(reader, &high_ptr))) {
+    return_reader_error(sd, reader);
+    return;
+  }
+  int fd = *fd64_ptr;
+  erl_drv_mutex_lock(sd->sockets_mutex);
+  SocketEntry **se_ptr = NULL;
+  JLG(se_ptr, sd->sockets, fd);
+  if (NULL != se_ptr && NULL != *se_ptr &&
+      pid == (*se_ptr)->pid && CONNECTED_SOCKET == (*se_ptr)->type) {
+    (*se_ptr)->socket.connected_socket.low = *low_ptr;
+    (*se_ptr)->socket.connected_socket.high = *high_ptr;
+    erl_drv_mutex_unlock(sd->sockets_mutex);
+    return_ok_pid(sd, fd, pid);
+  } else {
+    erl_drv_mutex_unlock(sd->sockets_mutex);
+    return_badarg_pid(sd, fd, pid, REPLY); /* programmer messed up */
+  }
+}
 
 /***********************
  *  ev_loop callbacks  *
@@ -818,6 +913,8 @@ SocketEntry *connected_socket_create(const int fd, ErlDrvTermData pid,
   se->type = CONNECTED_SOCKET;
   se->socket.connected_socket.quota = 0;
   se->socket.connected_socket.pending_writes = 0;
+  se->socket.connected_socket.high = -1;
+  se->socket.connected_socket.low = -1;
   se->socket.connected_socket.ev =
     (ErlIOVec *)driver_alloc(sizeof(ErlIOVec));
   if (NULL == se->socket.connected_socket.ev)
@@ -952,7 +1049,7 @@ static void hstcp_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
     int bytes_ready_int = -1;
 
     if (ioctl(fd, FIONREAD, &bytes_ready_int) < 0) {
-      return_socket_error_pid(sd, fd, errno, pid);
+      return_socket_error_pid(sd, fd, errno, pid, EVENT);
       return;
     }
     /* promote type to match with quota later on */
@@ -961,12 +1058,12 @@ static void hstcp_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
     if (0 == bytes_ready) {
       if (socket_entry_destroy(se, sd)) {
         if (0 > close(fd))
-          return_socket_error_pid(sd, fd, errno, pid);
+          return_socket_error_pid(sd, fd, errno, pid, EVENT);
         else
-          return_socket_closed_pid(sd, fd, pid);
+          return_socket_closed_pid(sd, fd, pid, EVENT);
       } else {
         /* someone else has already closed it. return closed */
-        return_socket_closed_pid(sd, fd, pid);
+        return_socket_closed_pid(sd, fd, pid, EVENT);
       }
 
     } else {
@@ -984,10 +1081,11 @@ static void hstcp_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
         achieved = recv(fd, binary->orig_bytes, requested, 0);
 
         if (0 > achieved) {
-          return_socket_error_pid(sd, fd, errno, pid);
+          return_socket_error_pid(sd, fd, errno, pid, EVENT);
           return;
         }
 
+        erl_drv_mutex_lock(sd->send_term_mutex);
         sd->data_spec[5] = fd;
         sd->data_spec[11] = (ErlDrvTermData)binary;
         sd->data_spec[12] = (ErlDrvUInt)achieved;
@@ -995,6 +1093,7 @@ static void hstcp_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
         sd->data_spec[5] = 0;
         sd->data_spec[11] = (ErlDrvTermData)NULL;
         sd->data_spec[12] = (ErlDrvUInt)0;
+        erl_drv_mutex_unlock(sd->send_term_mutex);
         driver_free_binary(binary);
 
       } else {
@@ -1005,6 +1104,12 @@ static void hstcp_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
 
         achieved = recv(fd, buf, requested, 0);
 
+        if (0 > achieved) {
+          return_socket_error_pid(sd, fd, errno, pid, EVENT);
+          return;
+        }
+
+        erl_drv_mutex_lock(sd->send_term_mutex);
         sd->small_data_spec[5] = fd;
         sd->small_data_spec[11] = (ErlDrvTermData)buf;
         sd->small_data_spec[12] = (ErlDrvUInt)achieved;
@@ -1013,6 +1118,7 @@ static void hstcp_ev_socket_read_cb(EV_P_ ev_io *w, int revents) {
         sd->small_data_spec[5] = 0;
         sd->small_data_spec[11] = (ErlDrvTermData)NULL;
         sd->small_data_spec[12] = (ErlDrvUInt)0;
+        erl_drv_mutex_unlock(sd->send_term_mutex);
         driver_free(buf);
       }
 
@@ -1078,7 +1184,7 @@ static void hstcp_ev_listen_cb(EV_P_ ev_io *w, int revents) {
         driver_failure(sd->port, -1);
       }
 
-      return_new_fd(sd, pid, fd, accepted_fd);
+      return_new_fd(sd, pid, fd, accepted_fd, EVENT);
 
       /* figure out if there are more pending acceptors */
       pid_ptr = NULL;
@@ -1112,7 +1218,9 @@ static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
 
     case HSTCP_ASYNC_START:
       mark_done_and_signal(sa);
+      erl_drv_mutex_lock(sd->send_term_mutex);
       driver_send_term(sd->port, sa->pid, sd->ok_spec, ATOM_SPEC_LEN);
+      erl_drv_mutex_unlock(sd->send_term_mutex);
       break;
 
     case HSTCP_ASYNC_EXIT:
@@ -1139,7 +1247,7 @@ static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
           *se_ptr = connected_socket_create(fd, pid, sd);
         erl_drv_mutex_unlock(sd->sockets_mutex);
 
-        return_new_fd(sd, pid, 0, fd);
+        return_new_fd(sd, pid, 0, fd, REPLY);
         break;
       }
 
@@ -1161,17 +1269,17 @@ static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
           erl_drv_mutex_unlock(sd->sockets_mutex);
           if (socket_entry_destroy(se, sd)) {
             if (0 > close(fd))
-              return_socket_error_pid(sd, fd, errno, se->pid);
+              return_socket_error_pid(sd, fd, errno, se->pid, REPLY);
             else
-              return_socket_closed_pid(sd, fd, pid);
+              return_socket_closed_pid(sd, fd, pid, REPLY);
           } else {
             /* someone else has already closed it. return closed */
-            return_socket_closed_pid(sd, fd, pid);
+            return_socket_closed_pid(sd, fd, pid, REPLY);
           }
 
         } else {
           erl_drv_mutex_unlock(sd->sockets_mutex);
-          return_badarg_pid(sd, fd, pid); /* programmer messed up */
+          return_badarg_pid(sd, fd, pid, REPLY); /* programmer messed up */
         }
         break;
       }
@@ -1215,11 +1323,11 @@ static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
           if (0 == index) /* if we're the first acceptor, enable the
                              watcher */
             ev_io_start(sd->epoller, se->watcher);
-          return_ok_pid(sd, pid, fd);
+          return_ok_pid(sd, fd, pid);
 
         } else {
           erl_drv_mutex_unlock(sd->sockets_mutex);
-          return_badarg_pid(sd, fd, pid); /* programmer messed up */
+          return_badarg_pid(sd, fd, pid, REPLY); /* programmer messed up */
         }
         break;
       }
@@ -1247,9 +1355,10 @@ static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
           else if (0 != new_quota && 0 == old_quota) {
             ev_io_start(sd->epoller, se->watcher);
           }
+          return_ok_pid(sd, fd, pid);
         } else {
           erl_drv_mutex_unlock(sd->sockets_mutex);
-          return_badarg_pid(sd, fd, pid); /* programmer messed up */
+          return_badarg_pid(sd, fd, pid, REPLY); /* programmer messed up */
         }
         break;
       }
@@ -1291,18 +1400,26 @@ static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
           if (NULL == ev_ptr->binv)
             driver_failure(sd->port, -1);
 
+          int64_t old_pending_writes =
+            se->socket.connected_socket.pending_writes;
           int old_offset = ev_ptr->vsize;
           for (int idx = 0; idx + new_offset < sa->ev->vsize; ++idx) {
             driver_binary_inc_refc(sa->ev->binv[new_offset + idx]);
             ev_ptr->iov[old_offset + idx] = sa->ev->iov[new_offset + idx];
             ev_ptr->binv[old_offset + idx] = sa->ev->binv[new_offset + idx];
-            /* we use size to mean writable size */
             se->socket.connected_socket.pending_writes +=
               (int64_t)sa->ev->iov[new_offset + idx].iov_len;
           }
           ev_ptr->vsize = total_length;
 
           erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
+
+          if (old_pending_writes < se->socket.connected_socket.high &&
+              se->socket.connected_socket.high <=
+              se->socket.connected_socket.pending_writes) {
+            /* gone over the high water mark */
+            return_socket_high_watermark(sd, sa->fd, se->pid);
+          }
 
           if (0 == old_offset) {
             SocketAction *sa1 = socket_action_alloc(HSTCP_ASYNC_WRITE, sa->fd,
@@ -1423,7 +1540,7 @@ int prepare_spec(const ErlDrvPort port, ErlDrvTermData **spec, const int len) {
     return FALSE;
 
   (*spec)[0] = ERL_DRV_ATOM;
-  (*spec)[1] = driver_mk_atom("hstcp_event");
+  (*spec)[1] = (ErlDrvTermData)NULL;
   (*spec)[2] = ERL_DRV_PORT;
   (*spec)[3] = driver_mk_port(port);
   (*spec)[4] = ERL_DRV_INT;
@@ -1444,6 +1561,12 @@ static ErlDrvData hstcp_start(const ErlDrvPort port, char *const buff) {
 
   sd->port = port;
   sd->pid = driver_caller(port);
+  sd->event = driver_mk_atom("hstcp_event");
+  sd->reply = driver_mk_atom("hstcp_reply");
+
+  sd->send_term_mutex = erl_drv_mutex_create("hstcp send term mutex");
+  if (NULL == sd->send_term_mutex)
+    return ERL_DRV_ERROR_GENERAL;
 
   if (! prepare_spec(port, &(sd->no_such_command_spec), ATOM_SPEC_LEN))
     return ERL_DRV_ERROR_GENERAL;
@@ -1452,11 +1575,13 @@ static ErlDrvData hstcp_start(const ErlDrvPort port, char *const buff) {
 
   if (! prepare_spec(port, &(sd->ok_spec), ATOM_SPEC_LEN))
     return ERL_DRV_ERROR_GENERAL;
+  sd->ok_spec[1] = sd->reply;
   sd->ok_spec[8] = ERL_DRV_ATOM;
   sd->ok_spec[9] = driver_mk_atom("ok");
 
   if (! prepare_spec(port, &(sd->reader_error_spec), STRING_ERROR_SPEC_LEN))
     return ERL_DRV_ERROR_GENERAL;
+  sd->reader_error_spec[1] = sd->reply;
   sd->reader_error_spec[8] = ERL_DRV_ATOM;
   sd->reader_error_spec[9] = driver_mk_atom("reader_error");
   sd->reader_error_spec[10] = ERL_DRV_STRING;
@@ -1490,6 +1615,7 @@ static ErlDrvData hstcp_start(const ErlDrvPort port, char *const buff) {
 
   if (! prepare_spec(port, &(sd->data_spec), DATA_SPEC_LEN))
     return ERL_DRV_ERROR_GENERAL;
+  sd->data_spec[1] = sd->event;
   sd->data_spec[8] = ERL_DRV_ATOM;
   sd->data_spec[9] = driver_mk_atom("data");
   sd->data_spec[10] = ERL_DRV_BINARY;
@@ -1501,6 +1627,7 @@ static ErlDrvData hstcp_start(const ErlDrvPort port, char *const buff) {
 
   if (! prepare_spec(port, &(sd->small_data_spec), SMALL_DATA_SPEC_LEN))
     return ERL_DRV_ERROR_GENERAL;
+  sd->small_data_spec[1] = sd->event;
   sd->small_data_spec[8] = ERL_DRV_ATOM;
   sd->small_data_spec[9] = driver_mk_atom("data");
   sd->small_data_spec[10] = ERL_DRV_BUF2BINARY;
@@ -1518,6 +1645,18 @@ static ErlDrvData hstcp_start(const ErlDrvPort port, char *const buff) {
     return ERL_DRV_ERROR_GENERAL;
   sd->badarg_spec[8] = ERL_DRV_ATOM;
   sd->badarg_spec[9] = driver_mk_atom("badarg");
+
+  if (! prepare_spec(port, &(sd->low_watermark_spec), ATOM_SPEC_LEN))
+    return ERL_DRV_ERROR_GENERAL;
+  sd->low_watermark_spec[1] = sd->event;
+  sd->low_watermark_spec[8] = ERL_DRV_ATOM;
+  sd->low_watermark_spec[9] = driver_mk_atom("low_watermark");
+
+  if (! prepare_spec(port, &(sd->high_watermark_spec), ATOM_SPEC_LEN))
+    return ERL_DRV_ERROR_GENERAL;
+  sd->high_watermark_spec[1] = sd->event;
+  sd->high_watermark_spec[8] = ERL_DRV_ATOM;
+  sd->high_watermark_spec[9] = driver_mk_atom("high_watermark");
 
   /* Note that startup here is a bit surprising: we don't want to
      create the epoller in this thread because if we do then we'll
@@ -1576,6 +1715,7 @@ static void hstcp_stop(const ErlDrvData drv_data) {
   command_enqueue_and_notify(sa, sd);
   erl_drv_thread_join(sd->tid, NULL);
 
+  erl_drv_mutex_destroy(sd->send_term_mutex);
   driver_free((char*)sd->no_such_command_spec);
   driver_free((char*)sd->ok_spec);
   driver_free((char*)sd->reader_error_spec);
@@ -1585,6 +1725,8 @@ static void hstcp_stop(const ErlDrvData drv_data) {
   driver_free((char*)sd->small_data_spec);
   driver_free((char*)sd->closed_spec);
   driver_free((char*)sd->badarg_spec);
+  driver_free((char*)sd->low_watermark_spec);
+  driver_free((char*)sd->high_watermark_spec);
   driver_free((char*)sd->async_watcher);
 
   erl_drv_mutex_destroy(sd->command_mutex);
@@ -1604,7 +1746,6 @@ static void hstcp_outputv(ErlDrvData drv_data, ErlIOVec *const ev) {
   const uint8_t* command = &hstcp_invalid_command;
   Reader reader;
   make_reader(ev, &reader);
-  ErlDrvTermData* spec = NULL;
   /* dump_ev(ev); */
   if (read_uint8(&reader, &command)) {
     switch (*command) {
@@ -1633,17 +1774,12 @@ static void hstcp_outputv(ErlDrvData drv_data, ErlIOVec *const ev) {
       socket_write(sd, &reader);
       break;
 
-    default:
-      spec = sd->no_such_command_spec;
+    case HSTCP_SET_OPTIONS:
+      socket_set_options(sd, &reader);
+      break;
+
     }
-  } else {
-    return_reader_error(sd, &reader);
   }
-
-  if (NULL != spec) {
-    driver_send_term(sd->port, sd->pid, spec, ATOM_SPEC_LEN);
-  }
-
 }
 
 static ErlDrvEntry hstcp_driver_entry =

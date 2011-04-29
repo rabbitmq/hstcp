@@ -17,16 +17,19 @@
 -module(hstcp_drv).
 
 -export([start/0, stop/1, listen/3, connect/3, close/1, accept/1,
-         recv/2, write/2]).
+         recv/2, write/2, set_options/3]).
 
 -define(LIBNAME, "libhstcp").
 
--define(HSTCP_LISTEN,   0). %% KEEP IN SYNC WITH HSTCP.H
--define(HSTCP_CONNECT,  1).
--define(HSTCP_CLOSE,    2).
--define(HSTCP_ACCEPT,   3).
--define(HSTCP_RECV,     4).
--define(HSTCP_WRITE,    5).
+-define(HSTCP_LISTEN,       0). %% KEEP IN SYNC WITH HSTCP.H
+-define(HSTCP_CONNECT,      1).
+-define(HSTCP_CLOSE,        2).
+-define(HSTCP_ACCEPT,       3).
+-define(HSTCP_RECV,         4).
+-define(HSTCP_WRITE,        5).
+-define(HSTCP_SET_OPTIONS,  6).
+
+-define(IS_WATERMARK(WM), WM =:= none orelse (is_integer(WM) andalso 0 =< WM)).
 
 start() ->
     erl_ddll:start(),
@@ -69,13 +72,20 @@ recv({Port, Fd}, Bytes) when Fd > 0 andalso Bytes >= 0 ->
 write({Port, Fd}, Data) when Fd > 0 ->
     true = port_command(
              Port, [<<?HSTCP_WRITE, Fd:64/native-signed>>, Data]),
-    ok.
+    simple_reply(Port, Fd).
+
+set_options({Port, Fd}, LowWatermark, HighWatermark)
+  when ?IS_WATERMARK(LowWatermark) andalso ?IS_WATERMARK(HighWatermark) ->
+    true = port_command(Port, <<?HSTCP_SET_OPTIONS, Fd:64/native-signed,
+                                LowWatermark:64/native-signed,
+                                HighWatermark:64/native-signed>>),
+    simple_reply(Port, Fd).
 
 %% ---------------------------------------------------------------------------
 
 simple_reply(Port, Fd) ->
     receive
-        {hstcp_event, {Port, Fd1}, Result} when Fd1 =:= Fd orelse Fd1 =:= 0 ->
+        {hstcp_reply, {Port, Fd1}, Result} when Fd1 =:= Fd orelse Fd1 =:= 0 ->
             Result
     end.
 
@@ -94,4 +104,4 @@ socket(Action, Port, IpAddress, IpPort) ->
 recv1(Port, Fd, N) ->
     true = port_command(
              Port, <<?HSTCP_RECV, Fd:64/native-signed, N:64/native-signed>>),
-    ok.
+    simple_reply(Port, Fd).
