@@ -48,8 +48,28 @@ enum _AsyncCommandType {
   HSTCP_ASYNC_RECV             = 5,
   HSTCP_ASYNC_WRITE            = 6,
   HSTCP_ASYNC_INCOMPLETE_WRITE = 7,
-  HSTCP_ASYNC_DESTROY_SOCKET   = 8
+  HSTCP_ASYNC_DESTROY_SOCKET   = 8,
+  HSTCP_ASYNC_CHECK_WATERMARKS = 9
 };
 typedef enum _AsyncCommandType AsyncCommandType;
+
+enum _SendType {
+  EVENT = 1,
+  REPLY = 2
+};
+typedef enum _SendType SendType;
+
+enum _SocketType {
+  LISTEN_SOCKET    = 1,
+  CONNECTED_SOCKET = 2
+};
+typedef enum _SocketType SocketType;
+
+enum _WatermarkLevel {
+  UNKNOWN_WATERMARK = 0,
+  LOW_WATERMARK     = 1,
+  HIGH_WATERMARK    = 2
+};
+typedef enum _WatermarkLevel WatermarkLevel;
 
 #endif

@@ -22,6 +22,7 @@
 -define(PORT, 5678).
 
 test() ->
+    timer:sleep(1000),
     passed = do([test_m || start_stop(),
                            start_listen_close_stop(),
                            start_listen_accept_close_stop(),
@@ -302,11 +303,12 @@ drain(Echo, Sock, Start, Count, Size) ->
 send(IpAddress, IpPort, Time) ->
     {ok, Sock} = hstcp_drv:start(),
     {new_fd, Sock1} = hstcp_drv:connect(Sock, IpAddress, IpPort),
-    %% set low at 1GB, high at 4GB
-    ok = hstcp_drv:set_options(Sock1, 1024*1024*1024, 1024*1024*4096),
+    %% set low at 1MB, high at 128MB
+    ok = hstcp_drv:set_options(Sock1, 1024*1024, 128*1024*1024),
+    receive {hstcp_event, Sock1, low_watermark} -> ok end,
     TRef = timer:send_after(Time, stop),
-    Bin = <<1:8388608>>, %% 1MB
-    List = lists:duplicate(16, Bin), %% 16MB
+    Bin = <<1:2097152>>, %% 256KB (8*1024*256)
+    List = lists:duplicate(64, Bin), %% 16MB
     Result = send1(Sock1, List, true),
     closed = hstcp_drv:close(Sock1),
     ok = hstcp_drv:stop(Sock),
@@ -321,7 +323,7 @@ send1(Sock, Payload, true) ->
             io:format("stopping send~n"),
             send1(Sock, Payload, false);
         {hstcp_event, Sock, low_watermark} ->
-            send1(Sock, Payload, true);
+            exit(low_watermark);
         {hstcp_event, Sock, Other} ->
             Other;
         stop -> ok
@@ -334,7 +336,7 @@ send1(Sock, Payload, false) ->
             io:format("starting send~n"),
             send1(Sock, Payload, true);
         {hstcp_event, Sock, high_watermark} ->
-            send1(Sock, Payload, false);
+            exit(high_watermark);
         {hstcp_event, Sock, Other} ->
             Other;
         stop -> ok

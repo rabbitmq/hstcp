@@ -54,12 +54,6 @@
 #define DATA_SPEC_LEN          18
 #define SMALL_DATA_SPEC_LEN    17
 
-#define LISTEN_SOCKET    1
-#define CONNECTED_SOCKET 2
-
-#define EVENT 1
-#define REPLY 2
-
 #define WRITE_COMMAND_PREFIX_LENGTH 9
 #define DEFAULT_IOV_MAX 16
 
@@ -76,7 +70,7 @@ typedef struct {
 
   ErlDrvTermData event;              /* 'hstcp_event'                                  */
   ErlDrvTermData reply;              /* 'hstcp_reply'                                  */
-  ErlDrvMutex    *send_term_mutex;   /* mutex for safely sending back to Erlang        */
+  ErlDrvMutex *  send_term_mutex;   /* mutex for safely sending back to Erlang        */
 
   /* {'hstcp_event', {Port, Fd}, 'no_such_command'}                                    */
   ErlDrvTermData *no_such_command_spec;
@@ -113,20 +107,20 @@ typedef struct {
 
   struct ev_loop *epoller;           /* our ev loop                                    */
   ErlDrvTid      tid;                /* the thread running our ev loop                 */
-  ev_async       *async_watcher;     /* the async watcher used to talk to our thread   */
-  ErlDrvMutex    *command_mutex;     /* mutex for safely communicating with our thread */
+  ev_async *     async_watcher;     /* the async watcher used to talk to our thread   */
+  ErlDrvMutex *  command_mutex;     /* mutex for safely communicating with our thread */
   Pvoid_t        command_queue;      /* the command being sent to our thread           */
   Pvoid_t        sockets;            /* the Judy array to store state of FDs in        */
-  ErlDrvMutex    *sockets_mutex;     /* mutex for safely accessing sockets             */
-  ErlDrvCond     *cond;              /* conditional for signalling from thread to drv  */
+  ErlDrvMutex *  sockets_mutex;     /* mutex for safely accessing sockets             */
+  ErlDrvCond *   cond;              /* conditional for signalling from thread to drv  */
   int            iov_max;
   int            socket_entry_serial;
 } HstcpData;
 
 typedef struct {
-  ErlIOVec *ev;
-  size_t row;
-  size_t column;
+  ErlIOVec *  ev;
+  size_t      row;
+  size_t      column;
   ReaderError last_error;
 } Reader;
 
@@ -135,40 +129,41 @@ typedef struct {
 } ListenSocket;
 
 typedef struct {
-  int64_t quota;
-  int64_t pending_writes;
-  ErlDrvMutex *mutex;
-  ErlIOVec *ev;
-  ev_io *watcher;
-  int64_t low;
-  int64_t high;
+  int64_t        quota;
+  int64_t        pending_writes;
+  ErlDrvMutex *  mutex;
+  ErlIOVec *     ev;
+  ev_io *        watcher;
+  int64_t        low;
+  int64_t        high;
+  WatermarkLevel watermark;
 } ConnectedSocket;
 
 typedef union {
-  ListenSocket listen_socket;
+  ListenSocket    listen_socket;
   ConnectedSocket connected_socket;
 } Socket;
 
 typedef struct {
-  uint8_t type;
-  int fd;
-  ev_io *watcher;
+  SocketType     type;
+  int            fd;
+  ev_io *        watcher;
   ErlDrvTermData pid;
-  Socket socket;
-  int serial;
+  Socket         socket;
+  int            serial;
 } SocketEntry;
 
 typedef struct {
-  int            fd;
-  uint8_t        type;
-  uint8_t        done;
-  uint8_t        free_when_done;
-  int64_t        value;
-  HstcpData      *sd;
-  ErlIOVec       *ev;
-  ErlDrvCond     *cond;
-  ErlDrvMutex    *mutex;
-  ErlDrvTermData pid;
+  int              fd;
+  AsyncCommandType type;
+  uint8_t          done;
+  uint8_t          free_when_done;
+  int64_t          value;
+  HstcpData *      sd;
+  ErlIOVec *       ev;
+  ErlDrvCond *     cond;
+  ErlDrvMutex *    mutex;
+  ErlDrvTermData   pid;
 } SocketAction;
 
 uint8_t hstcp_invalid_command = HSTCP_INVALID_COMMAND;
@@ -420,7 +415,7 @@ void return_socket_high_watermark(HstcpData *const sd, const int fd,
 }
 
 void return_socket_closed_pid(HstcpData *const sd, const int fd,
-                              ErlDrvTermData pid, const int type) {
+                              ErlDrvTermData pid, const SendType type) {
   erl_drv_mutex_lock(sd->send_term_mutex);
   if (REPLY == type)
     sd->closed_spec[1] = sd->reply;
@@ -433,7 +428,7 @@ void return_socket_closed_pid(HstcpData *const sd, const int fd,
 }
 
 void return_badarg_pid(HstcpData *const sd, const int fd,
-                       ErlDrvTermData pid, const int type) {
+                       ErlDrvTermData pid, const SendType type) {
   erl_drv_mutex_lock(sd->send_term_mutex);
   if (REPLY == type)
     sd->badarg_spec[1] = sd->reply;
@@ -446,7 +441,7 @@ void return_badarg_pid(HstcpData *const sd, const int fd,
 }
 
 void return_socket_error_pid(HstcpData *const sd, const int fd, const int error,
-                             ErlDrvTermData pid, const int type) {
+                             ErlDrvTermData pid, const SendType type) {
   const char* error_str = strerror(error);
   erl_drv_mutex_lock(sd->send_term_mutex);
   if (REPLY == type)
@@ -473,7 +468,7 @@ void return_ok_pid(HstcpData *const sd, const int fd,
 }
 
 void return_new_fd(HstcpData *const sd, ErlDrvTermData pid,
-                   const int old_fd, const int new_fd, const int type) {
+                   const int old_fd, const int new_fd, const SendType type) {
   erl_drv_mutex_lock(sd->send_term_mutex);
   if (REPLY == type)
     sd->new_fd_spec[1] = sd->reply;
@@ -703,6 +698,7 @@ void async_socket_write(SocketAction *const sa) {
   if (NULL != se_ptr && NULL != *se_ptr &&
       CONNECTED_SOCKET == (*se_ptr)->type) {
     se = *se_ptr;
+    ErlDrvTermData pid = se->pid;
     erl_drv_mutex_lock(se->socket.connected_socket.mutex);
     erl_drv_mutex_unlock(sd->sockets_mutex);
     int64_t ready = se->socket.connected_socket.pending_writes;
@@ -715,35 +711,28 @@ void async_socket_write(SocketAction *const sa) {
       /* printf("before:\r\n"); */
       /* dump_ev(ev_ptr); */
 
-      int iovcnt = ev_ptr->vsize > sd->iov_max ? sd->iov_max : ev_ptr->vsize;
+      int iovcnt = MIN(ev_ptr->vsize, sd->iov_max);
       /* deliberate promotion from ssize_t to int64_t - matches ready */
       int64_t written =
         (int64_t)writev(fd, (const struct iovec *)ev_ptr->iov, iovcnt);
       if (0 > written)
         err = errno;
 
-      if (0 < written &&
-          ready > se->socket.connected_socket.low &&
-          se->socket.connected_socket.low >= (ready - written)) {
-        /* we've written enough to fall below the low water mark*/
-        return_socket_low_watermark(sd, fd, se->pid);
-      }
-
       if (0 == written || EAGAIN == err || EWOULDBLOCK == err) {
         erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
 
         SocketAction *sa1 = socket_action_alloc(HSTCP_ASYNC_INCOMPLETE_WRITE, fd,
-                                                NULL, NULL, se->pid, sd);
+                                                NULL, NULL, pid, sd);
         command_enqueue_and_notify(sa1, sd);
 
       } else if (0 > written) {
-        return_socket_error_pid(sd, fd, err, se->pid, EVENT);
+        return_socket_error_pid(sd, fd, err, pid, EVENT);
         erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
 
         close(fd);
 
         SocketAction *sa1 = socket_action_alloc(HSTCP_ASYNC_DESTROY_SOCKET, fd,
-                                                NULL, NULL, se->pid, sd);
+                                                NULL, NULL, pid, sd);
         command_enqueue_and_notify(sa1, sd);
 
       } else if (written == ready) {
@@ -758,7 +747,12 @@ void async_socket_write(SocketAction *const sa) {
         se->socket.connected_socket.pending_writes = 0;
         erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
 
+        SocketAction *sa1 = socket_action_alloc(HSTCP_ASYNC_CHECK_WATERMARKS,
+                                                fd, NULL, NULL, pid, sd);
+        command_enqueue_and_notify(sa1, sd);
+
       } else {
+        /* int64_t written_orig = written; */
         int64_t remaining = ready - written;
         int gone = 0;
         int64_t written2 = 0;
@@ -778,16 +772,18 @@ void async_socket_write(SocketAction *const sa) {
 
         int vremaining = ev_ptr->vsize - gone;
 
-        /* printf("ready: %d; gone: %d; offset: %d; vremaining: %d; remaining %d\r\n", */
-        /*        ready, gone, written, vremaining, remaining); */
+        /* printf("ready: %ld; written: %ld; gone: %d; offset: %ld; " */
+        /*        "vremaining: %d; remaining %ld; next_len: %zu\r\n", */
+        /*        ready, written_orig, gone, written, vremaining, remaining, */
+        /*        ev_ptr->iov[gone].iov_len); */
 
+        se->socket.connected_socket.pending_writes = remaining;
         if (0 < gone) {
           /* move the tail up to the front, then shrink */
           memmove(ev_ptr->iov, &(ev_ptr->iov[gone]),
                   vremaining * sizeof(SysIOVec));
           memmove(ev_ptr->binv, &(ev_ptr->binv[gone]),
                   vremaining * sizeof(ErlDrvBinary *));
-          se->socket.connected_socket.pending_writes = remaining;
           ev_ptr->vsize = vremaining;
 
           ev_ptr->iov =
@@ -813,7 +809,7 @@ void async_socket_write(SocketAction *const sa) {
         erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
 
         SocketAction *sa1 = socket_action_alloc(HSTCP_ASYNC_INCOMPLETE_WRITE, fd,
-                                                NULL, NULL, se->pid, sd);
+                                                NULL, NULL, pid, sd);
         command_enqueue_and_notify(sa1, sd);
       }
     }
@@ -855,16 +851,23 @@ void socket_set_options(HstcpData *const sd, Reader *const reader) {
     return_reader_error(sd, reader);
     return;
   }
-  int fd = *fd64_ptr;
+  int fd = (int)*fd64_ptr;
   erl_drv_mutex_lock(sd->sockets_mutex);
   SocketEntry **se_ptr = NULL;
   JLG(se_ptr, sd->sockets, fd);
   if (NULL != se_ptr && NULL != *se_ptr &&
       pid == (*se_ptr)->pid && CONNECTED_SOCKET == (*se_ptr)->type) {
-    (*se_ptr)->socket.connected_socket.low = *low_ptr;
-    (*se_ptr)->socket.connected_socket.high = *high_ptr;
+    SocketEntry *se = *se_ptr;
+    erl_drv_mutex_lock(se->socket.connected_socket.mutex);
     erl_drv_mutex_unlock(sd->sockets_mutex);
+    se->socket.connected_socket.low = *low_ptr;
+    se->socket.connected_socket.high = *high_ptr;
+    se->socket.connected_socket.watermark = UNKNOWN_WATERMARK;
+    erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
     return_ok_pid(sd, fd, pid);
+    SocketAction *sa = socket_action_alloc(HSTCP_ASYNC_CHECK_WATERMARKS, fd,
+                                           NULL, NULL, pid, sd);
+    command_enqueue_and_notify(sa, sd);
   } else {
     erl_drv_mutex_unlock(sd->sockets_mutex);
     return_badarg_pid(sd, fd, pid, REPLY); /* programmer messed up */
@@ -874,6 +877,38 @@ void socket_set_options(HstcpData *const sd, Reader *const reader) {
 /***********************
  *  ev_loop callbacks  *
  ***********************/
+
+void check_watermarks(const int fd, HstcpData *const sd) {
+  SocketEntry **se_ptr = NULL;
+  erl_drv_mutex_lock(sd->sockets_mutex);
+  JLG(se_ptr, sd->sockets, fd);
+  if (NULL != se_ptr && NULL != *se_ptr &&
+      CONNECTED_SOCKET == (*se_ptr)->type) {
+    SocketEntry *se = *se_ptr;
+    erl_drv_mutex_lock(se->socket.connected_socket.mutex);
+    erl_drv_mutex_unlock(sd->sockets_mutex);
+
+    if (HIGH_WATERMARK != se->socket.connected_socket.watermark &&
+        -1 < se->socket.connected_socket.high &&
+        (se->socket.connected_socket.pending_writes >=
+         se->socket.connected_socket.high)) {
+      se->socket.connected_socket.watermark = HIGH_WATERMARK;
+      return_socket_high_watermark(sd, fd, se->pid);
+    }
+
+    if (LOW_WATERMARK != se->socket.connected_socket.watermark &&
+        -1 < se->socket.connected_socket.low &&
+        (se->socket.connected_socket.pending_writes <=
+         se->socket.connected_socket.low)) {
+      se->socket.connected_socket.watermark = LOW_WATERMARK;
+      return_socket_low_watermark(sd, fd, se->pid);
+    }
+
+    erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
+  } else {
+    erl_drv_mutex_unlock(sd->sockets_mutex);
+  }
+}
 
 static void hstcp_ev_socket_write_cb(EV_P_ ev_io *, int);
 static void hstcp_ev_socket_read_cb(EV_P_ ev_io *, int);
@@ -915,6 +950,7 @@ SocketEntry *connected_socket_create(const int fd, ErlDrvTermData pid,
   se->socket.connected_socket.pending_writes = 0;
   se->socket.connected_socket.high = -1;
   se->socket.connected_socket.low = -1;
+  se->socket.connected_socket.watermark = UNKNOWN_WATERMARK;
   se->socket.connected_socket.ev =
     (ErlIOVec *)driver_alloc(sizeof(ErlIOVec));
   if (NULL == se->socket.connected_socket.ev)
@@ -1214,7 +1250,7 @@ static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
   SocketAction *sa = NULL;
   command_dequeue(&sa, sd);
   while (NULL != sa) {
-   switch (sa->type) {
+    switch (sa->type) {
 
     case HSTCP_ASYNC_START:
       mark_done_and_signal(sa);
@@ -1367,13 +1403,13 @@ static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
       {
         /* need to copy out and extend the writer's ev before we can
            release the driver */
+        const int fd = sa->fd;
         erl_drv_mutex_lock(sd->sockets_mutex);
         SocketEntry **se_ptr = NULL;
-        SocketEntry *se = NULL;
-        JLG(se_ptr, sd->sockets, sa->fd);
+        JLG(se_ptr, sd->sockets, fd);
         if (NULL != se_ptr && NULL != *se_ptr &&
             CONNECTED_SOCKET == (*se_ptr)->type) {
-          se = *se_ptr;
+          SocketEntry *se = *se_ptr;
           erl_drv_mutex_lock(se->socket.connected_socket.mutex);
           erl_drv_mutex_unlock(sd->sockets_mutex);
           ErlIOVec *ev_ptr = se->socket.connected_socket.ev;
@@ -1400,8 +1436,6 @@ static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
           if (NULL == ev_ptr->binv)
             driver_failure(sd->port, -1);
 
-          int64_t old_pending_writes =
-            se->socket.connected_socket.pending_writes;
           int old_offset = ev_ptr->vsize;
           for (int idx = 0; idx + new_offset < sa->ev->vsize; ++idx) {
             driver_binary_inc_refc(sa->ev->binv[new_offset + idx]);
@@ -1414,15 +1448,8 @@ static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
 
           erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
 
-          if (old_pending_writes < se->socket.connected_socket.high &&
-              se->socket.connected_socket.high <=
-              se->socket.connected_socket.pending_writes) {
-            /* gone over the high water mark */
-            return_socket_high_watermark(sd, sa->fd, se->pid);
-          }
-
           if (0 == old_offset) {
-            SocketAction *sa1 = socket_action_alloc(HSTCP_ASYNC_WRITE, sa->fd,
+            SocketAction *sa1 = socket_action_alloc(HSTCP_ASYNC_WRITE, fd,
                                                     NULL, NULL, sa->pid, sd);
             mark_done_and_signal(sa);
             driver_async(sd->port, (unsigned int *)&(sa1->fd),
@@ -1430,6 +1457,8 @@ static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
           } else {
             mark_done_and_signal(sa);
           }
+
+          check_watermarks(fd, sd);
         } else {
           erl_drv_mutex_unlock(sd->sockets_mutex);
           mark_done_and_signal(sa);
@@ -1448,6 +1477,7 @@ static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
             CONNECTED_SOCKET == (*se_ptr)->type)
           ev_io_start(sd->epoller, (*se_ptr)->socket.connected_socket.watcher);
         erl_drv_mutex_unlock(sd->sockets_mutex);
+        check_watermarks(fd, sd);
         break;
       }
 
@@ -1472,6 +1502,15 @@ static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
         }
         break;
       }
+
+    case HSTCP_ASYNC_CHECK_WATERMARKS:
+      {
+        const int fd = sa->fd;
+        mark_done_and_signal(sa);
+        check_watermarks(fd, sd);
+        break;
+      }
+
     }
 
     command_dequeue(&sa, sd);
