@@ -1008,25 +1008,35 @@ int socket_entry_destroy(SocketEntry *se, HstcpData *const sd) {
     switch (se->type) {
 
     case LISTEN_SOCKET:
-      /* TODO - iterate through all acceptors and free them */
-      erl_drv_mutex_unlock(sd->sockets_mutex);
-      JLFA(freed, se->socket.listen_socket.acceptors);
-      break;
+      {
+        Word_t index = 0;
+        ErlDrvTermData *const *pid_ptr = NULL;
+        JLF(pid_ptr, se->socket.listen_socket.acceptors, index);
+        while (NULL != pid_ptr && NULL != *pid_ptr) {
+          driver_free(*pid_ptr);
+          JLN(pid_ptr, se->socket.listen_socket.acceptors, index);
+        }
+        JLFA(freed, se->socket.listen_socket.acceptors);
+        erl_drv_mutex_unlock(sd->sockets_mutex);
+        break;
+      }
 
     case CONNECTED_SOCKET:
-      /* TODO - maybe warn if the write queue's not empty? */
-      ev_io_stop(sd->epoller, se->socket.connected_socket.watcher);
-      driver_free(se->socket.connected_socket.watcher);
+      {
+        /* TODO - maybe warn if the write queue's not empty? */
+        ev_io_stop(sd->epoller, se->socket.connected_socket.watcher);
+        driver_free(se->socket.connected_socket.watcher);
 
-      erl_drv_mutex_lock(se->socket.connected_socket.mutex);
-      erl_drv_mutex_unlock(sd->sockets_mutex);
-      free_binaries(se->socket.connected_socket.ev);
-      driver_free(se->socket.connected_socket.ev->iov);
-      driver_free(se->socket.connected_socket.ev->binv);
-      driver_free(se->socket.connected_socket.ev);
-      erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
-      erl_drv_mutex_destroy(se->socket.connected_socket.mutex);
-      break;
+        erl_drv_mutex_lock(se->socket.connected_socket.mutex);
+        erl_drv_mutex_unlock(sd->sockets_mutex);
+        free_binaries(se->socket.connected_socket.ev);
+        driver_free(se->socket.connected_socket.ev->iov);
+        driver_free(se->socket.connected_socket.ev->binv);
+        driver_free(se->socket.connected_socket.ev);
+        erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
+        erl_drv_mutex_destroy(se->socket.connected_socket.mutex);
+        break;
+      }
 
     }
     driver_free(se);
@@ -1260,11 +1270,27 @@ static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
       break;
 
     case HSTCP_ASYNC_EXIT:
-      mark_done_and_signal(sa);
-      ev_async_stop(EV_A_ w);
-      ev_unloop(EV_A_ EVUNLOOP_ALL);
-      ev_loop_destroy(EV_A);
-      break;
+      {
+        mark_done_and_signal(sa);
+        ev_async_stop(EV_A_ w);
+        ev_unloop(EV_A_ EVUNLOOP_ALL);
+        ev_loop_destroy(EV_A);
+        Word_t index = 0;
+        SocketEntry **se_ptr = NULL;
+        SocketEntry *se = NULL;
+        erl_drv_mutex_lock(sd->sockets_mutex);
+        JLF(se_ptr, sd->sockets, index);
+        while (NULL != se_ptr && NULL != *se_ptr) {
+          se = *se_ptr;
+          /* destroy unlocks */
+          socket_entry_destroy(se, sd);
+          erl_drv_mutex_lock(sd->sockets_mutex);
+          index = 0;
+          JLF(se_ptr, sd->sockets, index);
+        }
+        erl_drv_mutex_unlock(sd->sockets_mutex);
+        break;
+      }
 
     case HSTCP_ASYNC_SOCKET:
       {

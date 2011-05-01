@@ -22,7 +22,6 @@
 -define(PORT, 5678).
 
 test() ->
-    timer:sleep(1000),
     passed = do([test_m || start_stop(),
                            start_listen_close_stop(),
                            start_listen_accept_close_stop(),
@@ -307,7 +306,10 @@ send(IpAddress, IpPort, Time) ->
     ok = hstcp_drv:set_options(Sock1, 1024*1024, 128*1024*1024),
     receive {hstcp_event, Sock1, low_watermark} -> ok end,
     TRef = timer:send_after(Time, stop),
-    Bin = <<1:2097152>>, %% 256KB (8*1024*256)
+    %% 256KB (8*1024*256)
+    PayloadSize = 252,
+    Bin = << <<PayloadSize:(8*4), 1:(8*PayloadSize)>>
+             || _ <- lists:seq(1, 1024) >>,
     List = lists:duplicate(64, Bin), %% 16MB
     Result = send1(Sock1, List, true),
     closed = hstcp_drv:close(Sock1),
