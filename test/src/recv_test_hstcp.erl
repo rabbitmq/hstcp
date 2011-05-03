@@ -60,7 +60,7 @@ recvloop(State = #s{buf = Buf}, Count) ->
     recvloop(State#s{buf = [Bin], size = size(Bin), expected = Expected},
              Count1).
 
-segment(<<L:32, Data:L/binary, Rest/binary>>, Count) ->
+segment(<<L:32, _Data:L/binary, Rest/binary>>, Count) ->
     segment(Rest, Count + 1);
 segment(<<L:32, Bin/binary>>, Count) ->
     {<<L:32, Bin/binary>>, L + 4, Count};
