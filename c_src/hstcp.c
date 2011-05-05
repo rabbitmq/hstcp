@@ -107,12 +107,13 @@ typedef struct {
 
   struct ev_loop *epoller;           /* our ev loop                                    */
   ErlDrvTid      tid;                /* the thread running our ev loop                 */
-  ev_async *     async_watcher;     /* the async watcher used to talk to our thread   */
-  ErlDrvMutex *  command_mutex;     /* mutex for safely communicating with our thread */
+  ev_async *     async_watcher;      /* the async watcher used to talk to our thread   */
+  ErlDrvMutex *  command_mutex;      /* mutex for safely communicating with our thread */
+  ErlDrvMutex *  queue_mutex;        /* mutex for enqueuing and dequeueing commands    */
   Pvoid_t        command_queue;      /* the command being sent to our thread           */
   Pvoid_t        sockets;            /* the Judy array to store state of FDs in        */
-  ErlDrvMutex *  sockets_mutex;     /* mutex for safely accessing sockets             */
-  ErlDrvCond *   cond;              /* conditional for signalling from thread to drv  */
+  ErlDrvMutex *  sockets_mutex;      /* mutex for safely accessing sockets             */
+  ErlDrvCond *   cond;               /* conditional for signalling from thread to drv  */
   int            iov_max;
   int            socket_entry_serial;
 } HstcpData;
@@ -307,14 +308,22 @@ void await_epoller(HstcpData *const sd) {
 }
 
 void mark_done_and_signal(SocketAction *sa) {
-  if (NULL != sa->mutex)
-    erl_drv_mutex_lock(sa->mutex);
+  ErlDrvMutex *const mutex = sa->mutex;
+  if (NULL != mutex) {
+    erl_drv_mutex_lock(mutex);
+  }
+  /* copy this out here: if we don't then by the time we've done the
+     signal, the other thread may have woken up, popped its stack, and
+     thus would cause the dereference to segfault */
+  const uint8_t free_when_done = sa->free_when_done;
   sa->done = TRUE;
-  if (NULL != sa->cond)
+  if (NULL != sa->cond) {
     erl_drv_cond_signal(sa->cond);
-  if (NULL != sa->mutex)
-    erl_drv_mutex_unlock(sa->mutex);
-  if (sa->free_when_done)
+  }
+  if (NULL != mutex) {
+    erl_drv_mutex_unlock(mutex);
+  }
+  if (free_when_done)
     driver_free(sa);
 }
 
@@ -322,8 +331,9 @@ void await_done(SocketAction *sa) {
   if (NULL == sa->mutex || NULL == sa->cond)
     return;
   erl_drv_mutex_lock(sa->mutex);
-  while (! sa->done)
+  while (! sa->done) {
     erl_drv_cond_wait(sa->cond, sa->mutex);
+  }
   erl_drv_mutex_unlock(sa->mutex);
 }
 
@@ -360,7 +370,7 @@ SocketAction *socket_action_alloc(const uint8_t type, const int fd,
 }
 
 void command_enqueue_and_notify(SocketAction *const sa, HstcpData *const sd) {
-  erl_drv_mutex_lock(sd->command_mutex);
+  erl_drv_mutex_lock(sd->queue_mutex);
   SocketAction **sa_ptr = NULL;
   Word_t index = -1;
   /* find the last present index in the command_queue */
@@ -371,12 +381,12 @@ void command_enqueue_and_notify(SocketAction *const sa, HstcpData *const sd) {
     ++index;
   JLI(sa_ptr, sd->command_queue, index);
   *sa_ptr = sa;
-  erl_drv_mutex_unlock(sd->command_mutex);
+  erl_drv_mutex_unlock(sd->queue_mutex);
   ev_async_send(sd->epoller, sd->async_watcher);
 }
 
 void command_dequeue(SocketAction **sa, HstcpData *const sd) {
-  erl_drv_mutex_lock(sd->command_mutex);
+  erl_drv_mutex_lock(sd->queue_mutex);
   SocketAction **sa_ptr = NULL;
   Word_t index = 0;
   /* find the first item in the command_queue */
@@ -388,7 +398,7 @@ void command_dequeue(SocketAction **sa, HstcpData *const sd) {
   } else {
     *sa = NULL;
   }
-  erl_drv_mutex_unlock(sd->command_mutex);
+  erl_drv_mutex_unlock(sd->queue_mutex);
 }
 
 
@@ -1520,8 +1530,8 @@ static void hstcp_ev_async_cb(EV_P_ ev_async *w, int revents) {
           /* destroy first to ensure no async writer is working on the
              fd when we do the */
           se = *se_ptr;
-          erl_drv_mutex_unlock(sd->sockets_mutex);
-          /* don't care if this succeeds or not */
+          /* don't care if this succeeds or not. However, it'll always
+             unlock sockets_mutex */
           socket_entry_destroy(se, sd);
         } else {
           erl_drv_mutex_unlock(sd->sockets_mutex);
@@ -1740,6 +1750,9 @@ static ErlDrvData hstcp_start(const ErlDrvPort port, char *const buff) {
   sd->command_mutex = erl_drv_mutex_create("hstcp command mutex");
   if (NULL == sd->command_mutex)
     return ERL_DRV_ERROR_GENERAL;
+  sd->queue_mutex = erl_drv_mutex_create("hstcp queue mutex");
+  if (NULL == sd->queue_mutex)
+    return ERL_DRV_ERROR_GENERAL;
   sd->command_queue = (Pvoid_t)NULL;
 
   sd->cond = erl_drv_cond_create("hstcp command condition");
@@ -1795,6 +1808,7 @@ static void hstcp_stop(const ErlDrvData drv_data) {
   driver_free((char*)sd->async_watcher);
 
   erl_drv_mutex_destroy(sd->command_mutex);
+  erl_drv_mutex_destroy(sd->queue_mutex);
   erl_drv_cond_destroy(sd->cond);
 
   erl_drv_mutex_destroy(sd->sockets_mutex);
