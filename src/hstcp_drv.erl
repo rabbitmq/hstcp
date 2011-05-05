@@ -76,9 +76,10 @@ write({Port, Fd}, Data) when Fd > 0 ->
 
 set_options({Port, Fd}, LowWatermark, HighWatermark)
   when ?IS_WATERMARK(LowWatermark) andalso ?IS_WATERMARK(HighWatermark) ->
-    true = port_command(Port, <<?HSTCP_SET_OPTIONS, Fd:64/native-signed,
-                                LowWatermark:64/native-signed,
-                                HighWatermark:64/native-signed>>),
+    true = port_command(
+             Port, <<?HSTCP_SET_OPTIONS, Fd:64/native-signed,
+                     (watermark_to_number(LowWatermark)):64/native-signed,
+                     (watermark_to_number(HighWatermark)):64/native-signed>>),
     simple_reply(Port, Fd).
 
 %% ---------------------------------------------------------------------------
@@ -105,3 +106,6 @@ recv1(Port, Fd, N) ->
     true = port_command(
              Port, <<?HSTCP_RECV, Fd:64/native-signed, N:64/native-signed>>),
     simple_reply(Port, Fd).
+
+watermark_to_number(none) -> -1;
+watermark_to_number(N)    -> N.
