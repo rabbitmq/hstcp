@@ -10,7 +10,7 @@
 /*   License for the specific language governing rights and limitations      */
 /*   under the License.                                                      */
 /*                                                                           */
-/*   The Original Code is HSTCP.                                               */
+/*   The Original Code is HSTCP.                                             */
 /*                                                                           */
 /*   The Initial Developers of the Original Code are VMware, Inc.            */
 /*   Copyright (c) 2011-2011 VMware, Inc.  All rights reserved.              */
@@ -70,7 +70,7 @@ typedef struct {
 
   ErlDrvTermData event;              /* 'hstcp_event'                                  */
   ErlDrvTermData reply;              /* 'hstcp_reply'                                  */
-  ErlDrvMutex *  send_term_mutex;   /* mutex for safely sending back to Erlang        */
+  ErlDrvMutex *  send_term_mutex;    /* mutex for safely sending back to Erlang        */
 
   /* {'hstcp_event', {Port, Fd}, 'no_such_command'}                                    */
   ErlDrvTermData *no_such_command_spec;
