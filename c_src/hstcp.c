@@ -53,6 +53,7 @@
 #define NEW_FD_SPEC_LEN        20
 #define DATA_SPEC_LEN          18
 #define SMALL_DATA_SPEC_LEN    17
+#define WATERMARK_SPEC_LEN     16
 
 #define WRITE_COMMAND_PREFIX_LENGTH 9
 #define DEFAULT_IOV_MAX 16
@@ -99,10 +100,10 @@ typedef struct {
   /* {'hstcp_event', {Port, Fd}, 'badarg'}                                             */
   ErlDrvTermData *badarg_spec;       /* terms for sending to a pid on general error    */
 
-  /* {'hstcp_event', {Port, Fd}, 'low_watermark'}                                      */
+  /* {'hstcp_event', {Port, Fd}, {'low_watermark', Low}}                               */
   ErlDrvTermData *low_watermark_spec;
 
-  /* {'hstcp_event', {Port, Fd}, 'high_watermark'}                                     */
+  /* {'hstcp_event', {Port, Fd}, {'high_watermark', High}}                             */
   ErlDrvTermData *high_watermark_spec;
 
   struct ev_loop *epoller;           /* our ev loop                                    */
@@ -407,20 +408,24 @@ void command_dequeue(SocketAction **sa, HstcpData *const sd) {
  ****************************/
 
 void return_socket_low_watermark(HstcpData *const sd, const int fd,
-                                 ErlDrvTermData pid) {
+                                 ErlDrvTermData pid, const int64_t low) {
   erl_drv_mutex_lock(sd->send_term_mutex);
   sd->low_watermark_spec[5] = (ErlDrvSInt)fd;
-  driver_send_term(sd->port, pid, sd->low_watermark_spec, ATOM_SPEC_LEN);
+  sd->low_watermark_spec[11] = (ErlDrvSInt)low;
+  driver_send_term(sd->port, pid, sd->low_watermark_spec, WATERMARK_SPEC_LEN);
   sd->low_watermark_spec[5] = 0;
+  sd->low_watermark_spec[11] = (ErlDrvSInt)0;
   erl_drv_mutex_unlock(sd->send_term_mutex);
 }
 
 void return_socket_high_watermark(HstcpData *const sd, const int fd,
-                                 ErlDrvTermData pid) {
+                                  ErlDrvTermData pid, const int64_t high) {
   erl_drv_mutex_lock(sd->send_term_mutex);
   sd->high_watermark_spec[5] = (ErlDrvSInt)fd;
-  driver_send_term(sd->port, pid, sd->high_watermark_spec, ATOM_SPEC_LEN);
+  sd->high_watermark_spec[11] = (ErlDrvSInt)high;
+  driver_send_term(sd->port, pid, sd->high_watermark_spec, WATERMARK_SPEC_LEN);
   sd->high_watermark_spec[5] = 0;
+  sd->high_watermark_spec[11] = (ErlDrvSInt)0;
   erl_drv_mutex_unlock(sd->send_term_mutex);
 }
 
@@ -903,15 +908,28 @@ void check_watermarks(const int fd, HstcpData *const sd) {
         (se->socket.connected_socket.pending_writes >=
          se->socket.connected_socket.high)) {
       se->socket.connected_socket.watermark = HIGH_WATERMARK;
-      return_socket_high_watermark(sd, fd, se->pid);
-    }
+      return_socket_high_watermark(sd, fd, se->pid,
+                                   se->socket.connected_socket.high);
 
-    if (LOW_WATERMARK != se->socket.connected_socket.watermark &&
+    } else if (LOW_WATERMARK != se->socket.connected_socket.watermark &&
         -1 < se->socket.connected_socket.low &&
         (se->socket.connected_socket.pending_writes <=
          se->socket.connected_socket.low)) {
       se->socket.connected_socket.watermark = LOW_WATERMARK;
-      return_socket_low_watermark(sd, fd, se->pid);
+      return_socket_low_watermark(sd, fd, se->pid,
+                                  se->socket.connected_socket.low);
+
+    } else if (HIGH_WATERMARK == se->socket.connected_socket.watermark &&
+        -1 < se->socket.connected_socket.high &&
+        (se->socket.connected_socket.pending_writes <
+         se->socket.connected_socket.high)) {
+      se->socket.connected_socket.watermark = UNKNOWN_WATERMARK;
+
+    } else if (LOW_WATERMARK == se->socket.connected_socket.watermark &&
+        -1 < se->socket.connected_socket.low &&
+        (se->socket.connected_socket.pending_writes >
+         se->socket.connected_socket.low)) {
+      se->socket.connected_socket.watermark = UNKNOWN_WATERMARK;
     }
 
     erl_drv_mutex_unlock(se->socket.connected_socket.mutex);
@@ -1721,17 +1739,25 @@ static ErlDrvData hstcp_start(const ErlDrvPort port, char *const buff) {
   sd->badarg_spec[8] = ERL_DRV_ATOM;
   sd->badarg_spec[9] = driver_mk_atom("badarg");
 
-  if (! prepare_spec(port, &(sd->low_watermark_spec), ATOM_SPEC_LEN))
+  if (! prepare_spec(port, &(sd->low_watermark_spec), WATERMARK_SPEC_LEN))
     return ERL_DRV_ERROR_GENERAL;
   sd->low_watermark_spec[1] = sd->event;
   sd->low_watermark_spec[8] = ERL_DRV_ATOM;
   sd->low_watermark_spec[9] = driver_mk_atom("low_watermark");
+  sd->low_watermark_spec[10] = ERL_DRV_INT;
+  sd->low_watermark_spec[11] = (ErlDrvSInt)0;
+  sd->low_watermark_spec[12] = ERL_DRV_TUPLE;
+  sd->low_watermark_spec[13] = 2;
 
-  if (! prepare_spec(port, &(sd->high_watermark_spec), ATOM_SPEC_LEN))
+  if (! prepare_spec(port, &(sd->high_watermark_spec), WATERMARK_SPEC_LEN))
     return ERL_DRV_ERROR_GENERAL;
   sd->high_watermark_spec[1] = sd->event;
   sd->high_watermark_spec[8] = ERL_DRV_ATOM;
   sd->high_watermark_spec[9] = driver_mk_atom("high_watermark");
+  sd->high_watermark_spec[10] = ERL_DRV_INT;
+  sd->high_watermark_spec[11] = (ErlDrvSInt)0;
+  sd->high_watermark_spec[12] = ERL_DRV_TUPLE;
+  sd->high_watermark_spec[13] = 2;
 
   /* Note that startup here is a bit surprising: we don't want to
      create the epoller in this thread because if we do then we'll

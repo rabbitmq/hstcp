@@ -303,42 +303,47 @@ send(IpAddress, IpPort, Time) ->
     {ok, Sock} = hstcp_drv:start(),
     {new_fd, Sock1} = hstcp_drv:connect(Sock, IpAddress, IpPort),
     %% set low at 1MB, high at 128MB
-    ok = hstcp_drv:set_options(Sock1, 1024*1024, 128*1024*1024),
-    receive {hstcp_event, Sock1, low_watermark} -> ok end,
+    Low = 1024*1024,
+    High = 128*Low,
+    ok = hstcp_drv:set_options(Sock1, Low, High),
+    receive {hstcp_event, Sock1, {low_watermark, Low}} -> ok end,
     TRef = timer:send_after(Time, stop),
     %% 256KB (8*1024*256)
     PayloadSize = 252,
     Bin = << <<PayloadSize:(8*4), 1:(8*PayloadSize)>>
              || _ <- lists:seq(1, 1024) >>,
     List = lists:duplicate(64, Bin), %% 16MB
-    Result = send1(Sock1, List, true),
+    Result = send1(Sock1, Low, High, List, true),
     closed = hstcp_drv:close(Sock1),
     ok = hstcp_drv:stop(Sock),
     timer:cancel(TRef),
     receive stop -> ok after 0 -> ok end,
     Result.
 
-send1(Sock, Payload, true) ->
+send1(Sock, Low, High, Payload, true) ->
     ok = hstcp_drv:write(Sock, Payload),
     receive
-        {hstcp_event, Sock, high_watermark} ->
+        {hstcp_event, Sock, {high_watermark, High}} ->
             io:format("stopping send~n"),
-            send1(Sock, Payload, false);
-        {hstcp_event, Sock, low_watermark} ->
-            exit(low_watermark);
+            send1(Sock, Low, High, Payload, false);
+        {hstcp_event, Sock, {low_watermark, Low}} ->
+            %% This is ok: it means that there was temporarily more
+            %% than Low enqueued and it's now cleared, thus dropping
+            %% below the low again.
+            send1(Sock, Low, High, Payload, true);
         {hstcp_event, Sock, Other} ->
             Other;
         stop -> ok
     after 0 ->
-        send1(Sock, Payload, true)
+        send1(Sock, Low, High, Payload, true)
     end;
-send1(Sock, Payload, false) ->
+send1(Sock, Low, High, Payload, false) ->
     receive
-        {hstcp_event, Sock, low_watermark} ->
+        {hstcp_event, Sock, {low_watermark, Low}} ->
             io:format("starting send~n"),
-            send1(Sock, Payload, true);
+            send1(Sock, Low, High, Payload, true);
         {hstcp_event, Sock, high_watermark} ->
-            exit(high_watermark);
+            send1(Sock, Low, High, Payload, false);
         {hstcp_event, Sock, Other} ->
             Other;
         stop -> ok
