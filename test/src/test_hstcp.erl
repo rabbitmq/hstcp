@@ -16,23 +16,22 @@
 
 -module(test_hstcp).
 
--compile({parse_transform, erlando}).
 -compile([export_all]).
 
 -define(PORT, 5678).
 
 test() ->
-    passed = do([test_m || start_stop(),
-                           start_listen_close_stop(),
-                           start_listen_accept_close_stop(),
-                           start_listen_accept_connect_close_close_stop_1(),
-                           start_listen_accept_connect_close_close_stop_2(),
-                           write_client_server(),
-                           write_server_client(),
-                           write_server_client_variations(),
-                           write_server_client_one_big(),
-                           write_server_client_streaming()
-                ]).
+    test:test([{?MODULE, [start_stop,
+                          start_listen_close_stop,
+                          start_listen_accept_close_stop,
+                          start_listen_accept_connect_close_close_stop_1,
+                          start_listen_accept_connect_close_close_stop_2,
+                          write_client_server,
+                          write_server_client,
+                          write_server_client_variations,
+                          write_server_client_one_big,
+                          write_server_client_streaming]}],
+              [report, {name, ?MODULE}]).
 
 start_stop() ->
     twice(fun () ->
