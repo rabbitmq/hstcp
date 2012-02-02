@@ -11,7 +11,7 @@
 %%  The Original Code is HSTCP.
 %%
 %%  The Initial Developer of the Original Code is VMware, Inc.
-%%  Copyright (c) 2009-2011 VMware, Inc.  All rights reserved.
+%%  Copyright (c) 2009-2012 VMware, Inc.  All rights reserved.
 %%
 
 -module(recv_test_hstcp).

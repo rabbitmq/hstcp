@@ -13,7 +13,7 @@
 /*   The Original Code is HSTCP.                                               */
 /*                                                                           */
 /*   The Initial Developers of the Original Code are VMware, Inc.            */
-/*   Copyright (c) 2011-2011 VMware, Inc.  All rights reserved.              */
+/*   Copyright (c) 2011-2012 VMware, Inc.  All rights reserved.              */
 /*                                                                           */
 /* ------------------------------------------------------------------------- */
 
